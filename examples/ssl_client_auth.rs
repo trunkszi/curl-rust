@@ -1,7 +1,7 @@
 use std::env;
-use std::io::{stdout, Write};
+use std::io::{Write, stdout};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use curl::easy::Easy;
 
 fn main() -> Result<()> {
@@ -41,6 +41,8 @@ fn main() -> Result<()> {
         handle.cainfo(cainfo)?;
     }
 
-    handle.perform()?;
+    let mut event_loop = curl::EventLoop::new().unwrap();
+    event_loop.add(handle, |_, _| {}).unwrap();
+    event_loop.run().unwrap();
     Ok(())
 }

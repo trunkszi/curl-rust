@@ -411,7 +411,7 @@ impl error::Error for ShareError {}
 
 /// An error from "multi" operations.
 ///
-/// THis structure wraps a `CURLMcode`.
+/// This structure wraps a `CURLMcode`.
 #[derive(Clone, PartialEq)]
 pub struct MultiError {
     code: curl_sys::CURLMcode,

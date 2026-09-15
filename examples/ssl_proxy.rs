@@ -21,7 +21,9 @@ fn main() -> Result<()> {
     handle.proxy_sslkey(sslkey)?;
     println!("ssl proxy setup done");
 
-    handle.perform()?;
+    let mut event_loop = curl::EventLoop::new().unwrap();
+    event_loop.add(handle, |_, _| {}).unwrap();
+    event_loop.run().unwrap();
     println!("connected done");
     Ok(())
 }

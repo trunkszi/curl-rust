@@ -1,3 +1,4 @@
+#![allow(function_casts_as_integer)]
 #![allow(bad_style)]
 
 use curl_sys::*;

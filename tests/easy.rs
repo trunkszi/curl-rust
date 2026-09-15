@@ -13,11 +13,12 @@ macro_rules! t {
     };
 }
 
-use curl::easy::{Easy, Easy2, List, ReadError, Transfer, WriteError};
+use curl::easy::{Easy, List, ReadError, WriteError};
 use curl::{Error, Version};
 
 use crate::server::Server;
 mod server;
+mod support;
 
 fn handle() -> Easy {
     let mut e = Easy::new();
@@ -43,7 +44,7 @@ fn get_smoke() {
 
     let mut handle = handle();
     t!(handle.url(&s.url("/")));
-    t!(handle.perform());
+    t!(support::perform(&mut handle));
 }
 
 #[test]
@@ -60,7 +61,7 @@ fn download_zero_size() {
 
     let mut handle = handle();
     t!(handle.url(&s.url("/")));
-    t!(handle.perform());
+    t!(support::perform(&mut handle));
     assert_eq!(handle.download_size().unwrap(), 0_f64);
 }
 
@@ -78,7 +79,7 @@ fn download_nonzero_size() {
 
     let mut handle = handle();
     t!(handle.url(&s.url("/")));
-    t!(handle.perform());
+    t!(support::perform(&mut handle));
     assert_eq!(handle.download_size().unwrap(), 6_f64);
 }
 
@@ -96,7 +97,7 @@ fn upload_zero_size() {
 
     let mut handle = handle();
     t!(handle.url(&s.url("/")));
-    t!(handle.perform());
+    t!(support::perform(&mut handle));
     assert_eq!(handle.upload_size().unwrap(), 0_f64);
 }
 
@@ -128,9 +129,8 @@ fn upload_nonzero_size() {
     t!(h.upload(true));
     t!(h.http_headers(list));
     {
-        let mut h = h.transfer();
-        t!(h.read_function(|buf| Ok(data.read(buf).unwrap())));
-        t!(h.perform());
+        t!(h.read_function(move |buf| Ok(data.read(buf).unwrap())));
+        t!(support::perform(&mut h));
     }
 
     assert_eq!(h.upload_size().unwrap(), 5_f64);
@@ -150,7 +150,7 @@ fn get_path() {
 
     let mut handle = handle();
     t!(handle.url(&s.url("/foo")));
-    t!(handle.perform());
+    t!(support::perform(&mut handle));
 }
 
 #[test]
@@ -165,18 +165,18 @@ fn write_callback() {
     );
     s.send("HTTP/1.1 200 OK\r\n\r\nhello!");
 
-    let mut all = Vec::<u8>::new();
+    let all = Rc::new(RefCell::new(Vec::<u8>::new()));
     {
         let mut handle = handle();
         t!(handle.url(&s.url("/")));
-        let mut handle = handle.transfer();
-        t!(handle.write_function(|data| {
-            all.extend(data);
+        let output = Rc::clone(&all);
+        t!(handle.write_function(move |data| {
+            output.borrow_mut().extend(data);
             Ok(data.len())
         }));
-        t!(handle.perform());
+        t!(support::perform(&mut handle));
     }
-    assert_eq!(all, b"hello!");
+    assert_eq!(&*all.borrow(), b"hello!");
 }
 
 #[test]
@@ -191,12 +191,14 @@ fn resolve() {
     );
     s.send("HTTP/1.1 200 OK\r\n\r\n");
 
-    let mut list = List::new();
-    t!(list.append(&format!("example.com:{}:127.0.0.1", s.addr().port())));
     let mut handle = handle();
     t!(handle.url(&format!("http://example.com:{}/", s.addr().port())));
-    t!(handle.resolve(list));
-    t!(handle.perform());
+    t!(handle.resolve_host(
+        "example.com",
+        s.addr().port(),
+        &["127.0.0.1".parse().unwrap()]
+    ));
+    t!(support::perform(&mut handle));
 }
 
 #[test]
@@ -211,24 +213,22 @@ fn progress() {
     );
     s.send("HTTP/1.1 200 OK\r\n\r\nHello!");
 
-    let mut hits = 0;
-    let mut dl = 0.0;
+    let stats = Rc::new(Cell::new((0, 0.0)));
     {
         let mut handle = handle();
         t!(handle.url(&s.url("/foo")));
         t!(handle.progress(true));
         t!(handle.write_function(sink));
 
-        let mut handle = handle.transfer();
-        t!(handle.progress_function(|_, a, _, _| {
-            hits += 1;
-            dl = a;
+        let output = Rc::clone(&stats);
+        t!(handle.progress_function(move |_, a, _, _| {
+            output.set((output.get().0 + 1, a));
             true
         }));
-        t!(handle.perform());
+        t!(support::perform(&mut handle));
     }
-    assert!(hits > 0);
-    assert_eq!(dl, 6.0);
+    assert!(stats.get().0 > 0);
+    assert_eq!(stats.get().1, 6.0);
 }
 
 #[test]
@@ -250,21 +250,23 @@ Bar: baz\r\n\
 Hello!",
     );
 
-    let mut headers = Vec::new();
+    let headers = Rc::new(RefCell::new(Vec::new()));
     {
         let mut handle = handle();
         t!(handle.url(&s.url("/")));
 
-        let mut handle = handle.transfer();
-        t!(handle.header_function(|h| {
-            headers.push(str::from_utf8(h).unwrap().to_string());
+        let output = Rc::clone(&headers);
+        t!(handle.header_function(move |h| {
+            output
+                .borrow_mut()
+                .push(str::from_utf8(h).unwrap().to_string());
             true
         }));
         t!(handle.write_function(sink));
-        t!(handle.perform());
+        t!(support::perform(&mut handle));
     }
     assert_eq!(
-        headers,
+        *headers.borrow(),
         vec![
             "HTTP/1.1 200 OK\r\n".to_string(),
             "Foo: bar\r\n".to_string(),
@@ -293,7 +295,7 @@ fn fail_on_error() {
     let mut h = handle();
     t!(h.url(&s.url("/")));
     t!(h.fail_on_error(true));
-    assert!(h.perform().is_err());
+    assert!(support::perform(&mut h).is_err());
 
     let s = Server::new();
     s.receive(
@@ -312,7 +314,7 @@ fn fail_on_error() {
     let mut h = handle();
     t!(h.url(&s.url("/")));
     t!(h.fail_on_error(false));
-    t!(h.perform());
+    t!(support::perform(&mut h));
 }
 
 #[test]
@@ -321,7 +323,7 @@ fn port() {
     s.receive(
         "\
          GET / HTTP/1.1\r\n\
-         Host: localhost:$PORT\r\n\
+         Host: 127.0.0.1:$PORT\r\n\
          Accept: */*\r\n\
          \r\n",
     );
@@ -332,9 +334,9 @@ fn port() {
     );
 
     let mut h = handle();
-    t!(h.url("http://localhost/"));
+    t!(h.url("http://127.0.0.1/"));
     t!(h.port(s.addr().port()));
-    t!(h.perform());
+    t!(support::perform(&mut h));
 }
 
 #[test]
@@ -355,8 +357,9 @@ fn proxy() {
 
     let mut h = handle();
     t!(h.url("http://example.com/"));
+    t!(h.resolve_host("example.com", 80, &["127.0.0.1".parse().unwrap()]));
     t!(h.proxy(&s.url("/")));
-    t!(h.perform());
+    t!(support::perform(&mut h));
 }
 
 #[test]
@@ -380,7 +383,7 @@ fn noproxy() {
     t!(h.url(&s.url("/")));
     t!(h.proxy(&s.url("/")));
     t!(h.noproxy("127.0.0.1"));
-    t!(h.perform());
+    t!(support::perform(&mut h));
 }
 
 #[test]
@@ -432,7 +435,7 @@ fn userpass() {
     t!(h.url(&s.url("/")));
     t!(h.username("foo"));
     t!(h.username("bar"));
-    t!(h.perform());
+    t!(support::perform(&mut h));
 }
 
 #[test]
@@ -455,45 +458,7 @@ fn accept_encoding() {
     let mut h = handle();
     t!(h.url(&s.url("/")));
     t!(h.accept_encoding("gzip"));
-    t!(h.perform());
-}
-
-#[test]
-fn follow_location() {
-    let s1 = Server::new();
-    let s2 = Server::new();
-    s1.receive(
-        "\
-         GET / HTTP/1.1\r\n\
-         Host: 127.0.0.1:$PORT\r\n\
-         Accept: */*\r\n\
-         \r\n",
-    );
-    s1.send(&format!(
-        "\
-         HTTP/1.1 301 Moved Permanently\r\n\
-         Location: http://{}/foo\r\n\
-         \r\n",
-        s2.addr()
-    ));
-
-    s2.receive(
-        "\
-         GET /foo HTTP/1.1\r\n\
-         Host: 127.0.0.1:$PORT\r\n\
-         Accept: */*\r\n\
-         \r\n",
-    );
-    s2.send(
-        "\
-         HTTP/1.1 200 OK\r\n\
-         \r\n",
-    );
-
-    let mut h = handle();
-    t!(h.url(&s1.url("/")));
-    t!(h.follow_location(true));
-    t!(h.perform());
+    t!(support::perform(&mut h));
 }
 
 #[test]
@@ -523,9 +488,8 @@ fn put() {
     t!(h.in_filesize(5));
     t!(h.upload(true));
     t!(h.http_headers(list));
-    let mut h = h.transfer();
-    t!(h.read_function(|buf| Ok(data.read(buf).unwrap())));
-    t!(h.perform());
+    t!(h.read_function(move |buf| Ok(data.read(buf).unwrap())));
+    t!(support::perform(&mut h));
 }
 
 #[test]
@@ -551,7 +515,7 @@ fn post1() {
     t!(h.url(&s.url("/")));
     t!(h.post(true));
     t!(h.post_fields_copy(b"data\n"));
-    t!(h.perform());
+    t!(support::perform(&mut h));
 }
 
 #[test]
@@ -578,7 +542,7 @@ fn post2() {
     t!(h.post(true));
     t!(h.post_fields_copy(b"data\n"));
     t!(h.write_function(sink));
-    t!(h.perform());
+    t!(support::perform(&mut h));
 }
 
 #[test]
@@ -605,9 +569,8 @@ fn post3() {
     t!(h.url(&s.url("/")));
     t!(h.post(true));
     t!(h.post_field_size(5));
-    let mut h = h.transfer();
-    t!(h.read_function(|buf| Ok(data.read(buf).unwrap())));
-    t!(h.perform());
+    t!(h.read_function(move |buf| Ok(data.read(buf).unwrap())));
+    t!(support::perform(&mut h));
 }
 
 #[test]
@@ -630,7 +593,7 @@ fn referer() {
     let mut h = handle();
     t!(h.url(&s.url("/")));
     t!(h.referer("foo"));
-    t!(h.perform());
+    t!(support::perform(&mut h));
 }
 
 #[test]
@@ -653,7 +616,7 @@ fn useragent() {
     let mut h = handle();
     t!(h.url(&s.url("/")));
     t!(h.useragent("foo"));
-    t!(h.perform());
+    t!(support::perform(&mut h));
 }
 
 #[test]
@@ -678,7 +641,7 @@ fn custom_headers() {
     let mut h = handle();
     t!(h.url(&s.url("/")));
     t!(h.http_headers(custom));
-    t!(h.perform());
+    t!(support::perform(&mut h));
 }
 
 #[test]
@@ -701,7 +664,7 @@ fn cookie() {
     let mut h = handle();
     t!(h.url(&s.url("/")));
     t!(h.cookie("foo"));
-    t!(h.perform());
+    t!(support::perform(&mut h));
 }
 
 #[test]
@@ -738,7 +701,7 @@ fn getters() {
     let mut h = handle();
     t!(h.url(&s.url("/")));
     t!(h.cookie_file("/dev/null"));
-    t!(h.perform());
+    t!(support::perform(&mut h));
     assert_eq!(t!(h.response_code()), 200);
     assert_eq!(t!(h.redirect_count()), 0);
     assert_eq!(t!(h.redirect_url()), None);
@@ -774,7 +737,7 @@ fn panic_in_callback() {
     let mut h = handle();
     t!(h.url(&s.url("/")));
     t!(h.header_function(|_| panic!()));
-    t!(h.perform());
+    t!(support::perform(&mut h));
 }
 
 #[test]
@@ -809,12 +772,12 @@ fn abort_read() {
     let mut list = List::new();
     t!(list.append("Expect:"));
     t!(h.http_headers(list));
-    let err = h.perform().unwrap_err();
-    assert!(err.is_aborted_by_callback());
+    let err = support::perform(&mut h).unwrap_err();
+    assert!(matches!(err, curl::event_loop::Error::Curl(ref e) if e.is_aborted_by_callback()));
 }
 
 #[test]
-fn pause_write_then_resume() {
+fn pause_write_then_resume_through_event_loop() {
     let s = Server::new();
     s.receive(
         "\
@@ -823,94 +786,46 @@ fn pause_write_then_resume() {
          Accept: */*\r\n\
          \r\n",
     );
-    s.send(
-        "\
-HTTP/1.1 200 OK\r\n\
-\r\n
-a\n
-b",
-    );
+    s.send("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\na\nb");
 
     let mut h = handle();
     t!(h.url(&s.url("/")));
-    t!(h.progress(true));
-
-    struct State<'a, 'b> {
-        paused: Cell<bool>,
-        unpaused: Cell<bool>,
-        transfer: RefCell<Transfer<'a, 'b>>,
-    }
-
-    let h = Rc::new(State {
-        paused: Cell::new(false),
-        unpaused: Cell::new(false),
-        transfer: RefCell::new(h.transfer()),
-    });
-
-    let h2 = h.clone();
-    t!(h.transfer
-        .borrow_mut()
-        .write_function(move |data| if h2.unpaused.get() {
-            h2.unpaused.set(false);
-            Ok(data.len())
-        } else {
-            h2.paused.set(true);
-            Err(WriteError::Pause)
-        }));
-    let h2 = h.clone();
-    t!(h.transfer
-        .borrow_mut()
-        .progress_function(move |_, _, _, _| {
-            if h2.paused.get() {
-                h2.paused.set(false);
-                h2.unpaused.set(true);
-                t!(h2.transfer.borrow().unpause_write());
-            }
-            true
-        }));
-    t!(h.transfer.borrow().perform());
-}
-
-#[test]
-fn perform_in_perform_is_bad() {
-    let s = Server::new();
-    s.receive(
-        "\
-         GET / HTTP/1.1\r\n\
-         Host: 127.0.0.1:$PORT\r\n\
-         Accept: */*\r\n\
-         \r\n",
-    );
-    s.send(
-        "\
-HTTP/1.1 200 OK\r\n\
-\r\n
-a\n
-b",
-    );
-
-    let mut h = handle();
-    t!(h.url(&s.url("/")));
-    t!(h.progress(true));
-
-    let h = Rc::new(RefCell::new(h.transfer()));
-
-    let h2 = h.clone();
-    t!(h.borrow_mut().write_function(move |data| {
-        assert!(h2.borrow().perform().is_err());
+    let paused = Rc::new(Cell::new(false));
+    let paused_callback = Rc::clone(&paused);
+    let body = Rc::new(RefCell::new(Vec::new()));
+    let body_callback = Rc::clone(&body);
+    t!(h.write_function(move |data| {
+        if !paused_callback.replace(true) {
+            return Err(WriteError::Pause);
+        }
+        body_callback.borrow_mut().extend_from_slice(data);
         Ok(data.len())
     }));
-    t!(h.borrow().perform());
+
+    let mut event_loop = curl::EventLoop::new().unwrap();
+    let token = event_loop.add(h, |_, result| result.unwrap()).unwrap();
+    for _ in 0..20 {
+        assert!(event_loop.run_once(Duration::from_millis(50)).unwrap());
+        if paused.get() {
+            break;
+        }
+    }
+    assert!(paused.get());
+    event_loop
+        .with(token, |easy| easy.unpause_read())
+        .unwrap()
+        .unwrap();
+    event_loop.run().unwrap();
+    assert_eq!(&*body.borrow(), b"a\nb");
 }
 
-#[cfg(not(windows))]
 #[test]
 fn check_unix_socket() {
     let s = Server::new_unix();
     s.receive(
         "\
          POST / HTTP/1.1\r\n\
-         Host: localhost\r\n\
+         Host: 127.0.0.1\r\n\
          Accept: */*\r\n\
          Content-Length: 5\r\n\
          Content-Type: application/x-www-form-urlencoded\r\n\
@@ -928,28 +843,7 @@ fn check_unix_socket() {
     t!(h.url(&s.url("/")));
     t!(h.post(true));
     t!(h.post_fields_copy(b"data\n"));
-    t!(h.perform());
-}
-
-#[cfg(feature = "upkeep_7_62_0")]
-#[test]
-fn test_upkeep() {
-    let s = Server::new();
-    s.receive(
-        "\
-         GET / HTTP/1.1\r\n\
-         Host: 127.0.0.1:$PORT\r\n\
-         Accept: */*\r\n\
-         \r\n",
-    );
-    s.send("HTTP/1.1 200 OK\r\n\r\n");
-
-    let mut handle = handle();
-    t!(handle.url(&s.url("/")));
-    t!(handle.perform());
-
-    // Ensure that upkeep can be called on the handle without problem.
-    t!(handle.upkeep());
+    t!(support::perform(&mut h));
 }
 
 #[test]
@@ -971,7 +865,7 @@ fn path_as_is() {
     let mut h = handle();
     t!(h.url(&s.url("/test/../")));
     t!(h.path_as_is(true));
-    t!(h.perform());
+    t!(support::perform(&mut h));
 
     let addr = format!("http://{}/test/../", s.addr());
     assert_eq!(t!(h.response_code()), 200);
@@ -980,60 +874,490 @@ fn path_as_is() {
 
 #[test]
 fn test_connect_timeout() {
-    use curl::easy::Handler;
-    struct Collector(Vec<u8>);
-
-    impl Handler for Collector {
-        fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
-            self.0.extend_from_slice(data);
-            Ok(data.len())
-        }
-    }
-    let mut easy2 = Easy2::new(Collector(Vec::new()));
+    let mut easy = Easy::new();
 
     // Overflow value test must return an Error
     assert_eq!(
         Error::new(curl_sys::CURLE_BAD_FUNCTION_ARGUMENT),
-        easy2
-            .connect_timeout(Duration::from_secs(std::u64::MAX))
+        easy.connect_timeout(Duration::from_secs(std::u64::MAX))
             .unwrap_err()
     );
 
     // Valid value
     assert_eq!(
         (),
-        easy2
-            .connect_timeout(Duration::from_millis(i32::MAX as u64))
+        easy.connect_timeout(Duration::from_millis(i32::MAX as u64))
             .unwrap()
     );
 }
 
 #[test]
 fn test_timeout() {
-    use curl::easy::Handler;
-    struct Collector(Vec<u8>);
-
-    impl Handler for Collector {
-        fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
-            self.0.extend_from_slice(data);
-            Ok(data.len())
-        }
-    }
-    let mut easy2 = Easy2::new(Collector(Vec::new()));
+    let mut easy = Easy::new();
 
     // Overflow value test must return an Error
     assert_eq!(
         Error::new(curl_sys::CURLE_BAD_FUNCTION_ARGUMENT),
-        easy2
-            .timeout(Duration::from_secs(std::u64::MAX))
+        easy.timeout(Duration::from_secs(std::u64::MAX))
             .unwrap_err()
     );
 
     // Valid value
     assert_eq!(
         (),
-        easy2
-            .timeout(Duration::from_millis(i32::MAX as u64))
+        easy.timeout(Duration::from_millis(i32::MAX as u64))
             .unwrap()
+    );
+}
+
+#[test]
+fn event_loop_python_get() {
+    let service = support::PythonServer::start();
+    let mut easy = Easy::new();
+    easy.url(&service.url()).unwrap();
+    let body = Rc::new(RefCell::new(Vec::new()));
+    let output = Rc::clone(&body);
+    easy.write_function(move |data| {
+        output.borrow_mut().extend_from_slice(data);
+        Ok(data.len())
+    })
+    .unwrap();
+    let (_easy, result) = support::run(easy);
+    result.unwrap();
+    assert_eq!(&*body.borrow(), b"ok");
+}
+
+#[test]
+fn resolve_host_accepts_typed_addresses() {
+    let mut easy = Easy::new();
+    easy.resolve_host("example.test", 443, &["127.0.0.1".parse().unwrap()])
+        .unwrap();
+    easy.url("https://example.test/").unwrap();
+}
+
+#[test]
+fn python_https_get_with_custom_ca() {
+    let service = support::PythonServer::start_https();
+    let mut easy = Easy::new();
+    easy.url(&service.https_url()).unwrap();
+    easy.cainfo("tests/support/ca.pem").unwrap();
+    let body = Rc::new(RefCell::new(Vec::new()));
+    let out = Rc::clone(&body);
+    easy.write_function(move |data| {
+        out.borrow_mut().extend_from_slice(data);
+        Ok(data.len())
+    })
+    .unwrap();
+    support::perform(&mut easy).unwrap();
+    assert_eq!(&*body.borrow(), b"ok");
+}
+
+#[test]
+#[should_panic]
+fn event_loop_propagates_callback_panic() {
+    let server = Server::new();
+    server.receive("GET / HTTP/1.1\r\nHost: 127.0.0.1:$PORT\r\nAccept: */*\r\n\r\n");
+    server.send("HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx");
+    let mut easy = Easy::new();
+    easy.url(&server.url("/")).unwrap();
+    easy.write_function(|_| panic!("callback panic")).unwrap();
+    let mut event_loop = curl::EventLoop::new().unwrap();
+    event_loop.add(easy, |_, _| {}).unwrap();
+    let _ = event_loop.run();
+}
+
+use curl::websocket::{
+    CloseCode as WsCode, Message as WsMessage, Options as WsOptions, WebSocketClient as WsClient,
+    WebSocketHandler as WsHandler,
+};
+
+#[derive(Default)]
+struct WsObservations {
+    opened: usize,
+    messages: Vec<WsMessage>,
+    closes: Vec<(WsCode, String)>,
+    errors: Vec<curl::event_loop::Error>,
+}
+struct ObserveWs(Rc<RefCell<WsObservations>>);
+impl WsHandler for ObserveWs {
+    fn on_open(&mut self, _: &WsClient) {
+        self.0.borrow_mut().opened += 1;
+    }
+    fn on_message(&mut self, _: &WsClient, message: WsMessage) {
+        self.0.borrow_mut().messages.push(message);
+    }
+    fn on_close(&mut self, _: &WsClient, code: WsCode, reason: String) {
+        self.0.borrow_mut().closes.push((code, reason));
+    }
+    fn on_error(&mut self, _: &WsClient, error: curl::event_loop::Error) {
+        self.0.borrow_mut().errors.push(error);
+    }
+}
+fn observed_ws(
+    lp: &curl::EventLoop,
+    easy: Easy,
+    options: WsOptions,
+) -> (WsClient, Rc<RefCell<WsObservations>>) {
+    let observed = Rc::new(RefCell::new(WsObservations::default()));
+    let ws = WsClient::connect(lp, easy, options, ObserveWs(observed.clone())).unwrap();
+    (ws, observed)
+}
+fn drive_ws_until(lp: &mut curl::EventLoop, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !done() && std::time::Instant::now() < deadline {
+        lp.run_once(Duration::from_millis(10)).unwrap();
+    }
+    assert!(done(), "WebSocket operation did not finish before deadline");
+}
+
+#[test]
+fn websocket_handshake_delivers_connection_and_can_send() {
+    let service = support::PythonServer::start_ws();
+    let mut easy = Easy::new();
+    easy.url(&service.ws_url()).unwrap();
+    let mut lp = curl::EventLoop::new().unwrap();
+    let (ws, observed) = observed_ws(&lp, easy, WsOptions::default());
+    ws.send(WsMessage::Text("hello".into())).unwrap();
+    drive_ws_until(&mut lp, || !observed.borrow().messages.is_empty());
+    let events = observed.borrow();
+    assert_eq!(events.opened, 1);
+    assert_eq!(events.messages, vec![WsMessage::Text("hello".into())]);
+    assert!(events.closes.is_empty());
+}
+
+#[test]
+fn websocket_peer_tcp_close_invokes_on_close_once() {
+    let service = support::PythonServer::start_ws_close();
+    let mut easy = Easy::new();
+    easy.url(&service.ws_url()).unwrap();
+    let mut lp = curl::EventLoop::new().unwrap();
+    let (_ws, observed) = observed_ws(&lp, easy, WsOptions::default());
+    drive_ws_until(&mut lp, || !observed.borrow().closes.is_empty());
+    for _ in 0..3 {
+        lp.run_once(Duration::ZERO).unwrap();
+    }
+    assert_eq!(observed.borrow().closes.len(), 1);
+}
+
+#[test]
+fn websocket_message_size_limit_is_enforced() {
+    let bad = support::PythonServer::start_ws();
+    let good = support::PythonServer::start_ws();
+    let mut bad_easy = Easy::new();
+    bad_easy.url(&bad.ws_url()).unwrap();
+    let mut good_easy = Easy::new();
+    good_easy.url(&good.ws_url()).unwrap();
+    let mut lp = curl::EventLoop::new().unwrap();
+    let (bad_ws, rejected) = observed_ws(&lp, bad_easy, WsOptions::default().max_message_size(2));
+    let (good_ws, healthy) = observed_ws(&lp, good_easy, WsOptions::default());
+    bad_ws.send(WsMessage::Text("oversized".into())).unwrap();
+    drive_ws_until(&mut lp, || !rejected.borrow().closes.is_empty());
+    assert!(matches!(
+        rejected.borrow().errors.as_slice(),
+        [curl::event_loop::Error::MessageTooLarge]
+    ));
+    assert_eq!(rejected.borrow().closes[0].0, WsCode(1009));
+    good_ws
+        .send(WsMessage::Text("healthy after rejection".into()))
+        .unwrap();
+    drive_ws_until(&mut lp, || !healthy.borrow().messages.is_empty());
+    assert_eq!(
+        healthy.borrow().messages,
+        vec![WsMessage::Text("healthy after rejection".into())]
+    );
+}
+
+#[test]
+fn websocket_wss_echo_with_custom_ca() {
+    let service = support::PythonServer::start_wss();
+    let mut easy = Easy::new();
+    easy.url(&service.wss_url()).unwrap();
+    easy.cainfo("tests/support/ca.pem").unwrap();
+    let mut lp = curl::EventLoop::new().unwrap();
+    let (ws, observed) = observed_ws(&lp, easy, WsOptions::default());
+    let payload = WsMessage::Text("hello".into());
+    let expected = payload.clone();
+    ws.send(payload).unwrap();
+    drive_ws_until(&mut lp, || !observed.borrow().messages.is_empty());
+    assert_eq!(observed.borrow().messages, vec![expected]);
+}
+
+#[test]
+fn websocket_fragmented_message_is_reassembled() {
+    let service = support::PythonServer::start_ws_fragmented();
+    let mut easy = Easy::new();
+    easy.url(&service.ws_url()).unwrap();
+    let mut lp = curl::EventLoop::new().unwrap();
+    let (ws, observed) = observed_ws(&lp, easy, WsOptions::default());
+    let payload = WsMessage::Text("fragmented".into());
+    let expected = payload.clone();
+    ws.send(payload).unwrap();
+    drive_ws_until(&mut lp, || !observed.borrow().messages.is_empty());
+    assert_eq!(observed.borrow().messages, vec![expected]);
+}
+
+#[test]
+fn websocket_binary_roundtrip() {
+    let service = support::PythonServer::start_ws();
+    let mut easy = Easy::new();
+    easy.url(&service.ws_url()).unwrap();
+    let mut lp = curl::EventLoop::new().unwrap();
+    let (ws, observed) = observed_ws(&lp, easy, WsOptions::default());
+    let payload = WsMessage::Binary(
+        (0..1024 * 1024)
+            .map(|i| (i as u8).wrapping_mul(31))
+            .collect(),
+    );
+    let expected = payload.clone();
+    ws.send(payload).unwrap();
+    drive_ws_until(&mut lp, || !observed.borrow().messages.is_empty());
+    assert_eq!(observed.borrow().messages, vec![expected]);
+}
+
+#[test]
+fn websocket_ping_pong_visible() {
+    let service = support::PythonServer::start_ws();
+    let mut easy = Easy::new();
+    easy.url(&service.ws_url()).unwrap();
+    let mut lp = curl::EventLoop::new().unwrap();
+    let (ws, observed) = observed_ws(&lp, easy, WsOptions::default());
+    let payload = WsMessage::Ping(b"x".to_vec());
+    let expected = WsMessage::Pong(b"x".to_vec());
+    ws.send(payload).unwrap();
+    drive_ws_until(&mut lp, || !observed.borrow().messages.is_empty());
+    assert_eq!(observed.borrow().messages, vec![expected]);
+}
+
+#[test]
+fn websocket_close_handshake_completes() {
+    let service = support::PythonServer::start_ws();
+    let mut easy = Easy::new();
+    easy.url(&service.ws_url()).unwrap();
+    let mut lp = curl::EventLoop::new().unwrap();
+    let (ws, observed) = observed_ws(
+        &lp,
+        easy,
+        WsOptions::default().close_timeout(Duration::from_millis(200)),
+    );
+    drive_ws_until(&mut lp, || observed.borrow().opened == 1);
+    ws.close(WsCode::NORMAL, "bye").unwrap();
+    drive_ws_until(&mut lp, || !observed.borrow().closes.is_empty());
+    assert_eq!(observed.borrow().closes.len(), 1);
+    assert_eq!(observed.borrow().closes[0], (WsCode::NORMAL, "bye".into()));
+}
+
+#[test]
+fn websocket_close_timeout_when_peer_ignores() {
+    let service = support::PythonServer::start_ws_ignore_close();
+    let mut easy = Easy::new();
+    easy.url(&service.ws_url()).unwrap();
+    let mut lp = curl::EventLoop::new().unwrap();
+    let (ws, observed) = observed_ws(
+        &lp,
+        easy,
+        WsOptions::default().close_timeout(Duration::from_millis(200)),
+    );
+    drive_ws_until(&mut lp, || observed.borrow().opened == 1);
+    ws.close(WsCode::NORMAL, "bye").unwrap();
+    drive_ws_until(&mut lp, || !observed.borrow().closes.is_empty());
+    assert_eq!(observed.borrow().closes.len(), 1);
+    assert!(observed.borrow().closes[0].1.contains("timeout"));
+}
+
+#[test]
+fn websocket_idle_timeout_closes() {
+    let service = support::PythonServer::start_ws_ignore_close();
+    let mut easy = Easy::new();
+    easy.url(&service.ws_url()).unwrap();
+    let mut lp = curl::EventLoop::new().unwrap();
+    let (_ws, observed) = observed_ws(
+        &lp,
+        easy,
+        WsOptions::default().idle_timeout(Some(Duration::from_millis(300))),
+    );
+    drive_ws_until(&mut lp, || !observed.borrow().closes.is_empty());
+    assert_eq!(observed.borrow().closes.len(), 1);
+}
+#[test]
+fn http_and_websocket_share_event_loop() {
+    let http = support::PythonServer::start();
+    let service = support::PythonServer::start_ws();
+    let mut http_easy = Easy::new();
+    http_easy.url(&http.url()).unwrap();
+    http_easy.write_function(|d| Ok(d.len())).unwrap();
+    let mut easy = Easy::new();
+    easy.url(&service.ws_url()).unwrap();
+    let mut lp = curl::EventLoop::new().unwrap();
+    let done = Rc::new(Cell::new(false));
+    let flag = done.clone();
+    let client = curl::http::HttpClient::new(&lp);
+    let _request = client
+        .send(http_easy, move |_, result| {
+            result.unwrap();
+            flag.set(true);
+        })
+        .unwrap();
+    let (ws, observed) = observed_ws(&lp, easy, WsOptions::default());
+    ws.send(WsMessage::Text("hello".into())).unwrap();
+    drive_ws_until(&mut lp, || {
+        done.get() && !observed.borrow().messages.is_empty()
+    });
+    assert_eq!(
+        observed.borrow().messages,
+        vec![WsMessage::Text("hello".into())]
+    );
+}
+#[test]
+fn websocket_send_buffer_full() {
+    let service = support::PythonServer::start_ws_slow_read();
+    let mut easy = Easy::new();
+    easy.url(&service.ws_url()).unwrap();
+    let lp = curl::EventLoop::new().unwrap();
+    let (ws, _) = observed_ws(&lp, easy, WsOptions::default().max_send_buffer(64 * 1024));
+    assert!(matches!(
+        ws.send(WsMessage::Binary(vec![7; 128 * 1024])),
+        Err(curl::event_loop::Error::SendBufferFull)
+    ));
+}
+
+#[test]
+fn websocket_connect_returns_live_handle_and_queues_before_open() {
+    use curl::websocket::{Message, Options, WebSocketClient, WebSocketHandler, WebSocketState};
+    struct Handler(Rc<RefCell<Vec<String>>>);
+    impl WebSocketHandler for Handler {
+        fn on_open(&mut self, ws: &WebSocketClient) {
+            assert_eq!(ws.state(), WebSocketState::Open);
+            self.0.borrow_mut().push("open".into());
+        }
+        fn on_message(&mut self, _: &WebSocketClient, message: Message) {
+            if let Message::Text(text) = message {
+                self.0.borrow_mut().push(text);
+            }
+        }
+    }
+    let server = support::PythonServer::start_ws();
+    let mut easy = Easy::new();
+    easy.url(&server.ws_url()).unwrap();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut lp = curl::EventLoop::new().unwrap();
+    let ws =
+        WebSocketClient::connect(&lp, easy, Options::default(), Handler(events.clone())).unwrap();
+    assert_eq!(ws.state(), WebSocketState::Connecting);
+    ws.send(Message::Text("queued before handshake".into()))
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while events.borrow().len() < 2 && std::time::Instant::now() < deadline {
+        lp.run_once(Duration::from_millis(10)).unwrap();
+    }
+    assert_eq!(*events.borrow(), vec!["open", "queued before handshake"]);
+}
+
+#[test]
+fn http_client_request_handle_does_not_keep_event_loop_alive() {
+    let lp = curl::EventLoop::new().unwrap();
+    let client = curl::http::HttpClient::new(&lp);
+    let mut easy = Easy::new();
+    easy.url("http://127.0.0.1:1/").unwrap();
+    let handle = client.send(easy, |_, _| {}).unwrap();
+    drop(lp);
+    assert!(matches!(
+        handle.with(|_| ()),
+        Err(curl::event_loop::Error::LoopGone)
+    ));
+}
+
+#[test]
+fn http_client_sends_request_through_shared_event_loop() {
+    let server = Server::new();
+    server.receive("GET / HTTP/1.1\r\nHost: 127.0.0.1:$PORT\r\nAccept: */*\r\n\r\n");
+    server.send("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let mut easy = Easy::new();
+    easy.url(&server.url("/")).unwrap();
+    let body = Rc::new(RefCell::new(Vec::new()));
+    let out = body.clone();
+    easy.write_function(move |d| {
+        out.borrow_mut().extend_from_slice(d);
+        Ok(d.len())
+    })
+    .unwrap();
+    let lp = curl::EventLoop::new().unwrap();
+    let client = curl::http::HttpClient::new(&lp);
+    let done = Rc::new(RefCell::new(None));
+    let slot = done.clone();
+    let _handle = client
+        .send(easy, move |_, result| *slot.borrow_mut() = Some(result))
+        .unwrap();
+    let mut lp = lp;
+    lp.run().unwrap();
+    assert!(done.borrow().as_ref().unwrap().is_ok());
+    assert_eq!(body.borrow().as_slice(), b"ok");
+}
+
+#[test]
+fn websocket_handle_reports_loop_gone_after_event_loop_drop() {
+    struct Noop;
+    impl curl::websocket::WebSocketHandler for Noop {}
+    let lp = curl::EventLoop::new().unwrap();
+    let mut easy = Easy::new();
+    easy.url("ws://127.0.0.1:1/").unwrap();
+    let ws = curl::websocket::WebSocketClient::connect(
+        &lp,
+        easy,
+        curl::websocket::Options::default(),
+        Noop,
+    )
+    .unwrap();
+    drop(lp);
+    assert!(matches!(
+        ws.send(curl::websocket::Message::Ping(vec![])),
+        Err(curl::event_loop::Error::LoopGone)
+    ));
+}
+
+#[test]
+fn websocket_ping_interval_receives_pongs() {
+    let service = support::PythonServer::start_ws();
+    let mut easy = Easy::new();
+    easy.url(&service.ws_url()).unwrap();
+    let mut lp = curl::EventLoop::new().unwrap();
+    let (_ws, observed) = observed_ws(
+        &lp,
+        easy,
+        WsOptions::default().ping_interval(Some(Duration::from_millis(100))),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while std::time::Instant::now() < deadline
+        && observed
+            .borrow()
+            .messages
+            .iter()
+            .filter(|m| matches!(m, WsMessage::Pong(_)))
+            .count()
+            < 2
+    {
+        lp.run_once(Duration::from_millis(20)).unwrap();
+    }
+    assert!(
+        observed
+            .borrow()
+            .messages
+            .iter()
+            .filter(|m| matches!(m, WsMessage::Pong(_)))
+            .count()
+            >= 2
+    );
+}
+
+#[test]
+fn websocket_peer_active_close_is_acknowledged() {
+    let service = support::PythonServer::start_ws_active_close();
+    let mut easy = Easy::new();
+    easy.url(&service.ws_url()).unwrap();
+    let mut lp = curl::EventLoop::new().unwrap();
+    let (_ws, observed) = observed_ws(&lp, easy, WsOptions::default());
+    drive_ws_until(&mut lp, || !observed.borrow().closes.is_empty());
+    assert_eq!(
+        observed.borrow().closes[0],
+        (WsCode(1001), "going away".into())
     );
 }

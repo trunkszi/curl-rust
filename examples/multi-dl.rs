@@ -1,10 +1,7 @@
-use std::collections::HashMap;
-use std::time::Duration;
-
 use anyhow::Result;
-
-use curl::easy::{Easy2, Handler, WriteError};
-use curl::multi::{Easy2Handle, Multi};
+use curl::easy::Easy;
+use std::io::Write;
+use std::net::ToSocketAddrs;
 
 const URLS: &[&str] = &[
     "https://www.microsoft.com",
@@ -13,76 +10,34 @@ const URLS: &[&str] = &[
     "https://www.apple.com",
 ];
 
-struct Collector(Vec<u8>);
-impl Handler for Collector {
-    fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
-        self.0.extend_from_slice(data);
+fn download(url: &'static str) -> Result<Easy> {
+    let mut easy = Easy::new();
+    easy.url(url)?;
+    let host = url.split("//").nth(1).unwrap().split('/').next().unwrap();
+    let ips: Vec<_> = (host, 443).to_socket_addrs()?.map(|a| a.ip()).collect();
+    easy.resolve_host(host, 443, &ips)?;
+    easy.useragent("curl-rust event loop")?;
+    easy.write_function(move |data| {
+        std::io::sink().write_all(data).unwrap();
         Ok(data.len())
-    }
-}
-
-fn download(multi: &mut Multi, token: usize, url: &str) -> Result<Easy2Handle<Collector>> {
-    let version = curl::Version::get();
-    let mut request = Easy2::new(Collector(Vec::new()));
-    request.url(&url)?;
-    request.useragent(&format!("curl/{}", version.version()))?;
-
-    let mut handle = multi.add2(request)?;
-    handle.set_token(token)?;
-    Ok(handle)
+    })?;
+    Ok(easy)
 }
 
 fn main() -> Result<()> {
-    let mut multi = Multi::new();
-    let mut handles = URLS
-        .iter()
-        .enumerate()
-        .map(|(token, url)| Ok((token, download(&mut multi, token, url)?)))
-        .collect::<Result<HashMap<_, _>>>()?;
-
-    let mut still_alive = true;
-    while still_alive {
-        // We still need to process the last messages when
-        // `Multi::perform` returns "0".
-        if multi.perform()? == 0 {
-            still_alive = false;
-        }
-
-        multi.messages(|message| {
-            let token = message.token().expect("failed to get the token");
-            let handle = handles
-                .get_mut(&token)
-                .expect("the download value should exist in the HashMap");
-
-            match message
-                .result_for2(&handle)
-                .expect("token mismatch with the `EasyHandle`")
-            {
-                Ok(()) => {
-                    let http_status = handle
-                        .response_code()
-                        .expect("HTTP request finished without status code");
-
-                    println!(
-                        "R: Transfer succeeded (Status: {}) {} (Download length: {})",
-                        http_status,
-                        URLS[token],
-                        handle.get_ref().0.len()
-                    );
-                }
-                Err(error) => {
-                    println!("E: {} - <{}>", error, URLS[token]);
-                }
-            }
-        });
-
-        if still_alive {
-            // The sleeping time could be reduced to allow other processing.
-            // For instance, a thread could check a condition signalling the
-            // thread shutdown.
-            multi.wait(&mut [], Duration::from_secs(60))?;
-        }
+    let mut event_loop = curl::EventLoop::new().unwrap();
+    for &url in URLS {
+        event_loop
+            .add(download(url)?, move |easy, result| {
+                println!(
+                    "{}: status={:?}, result={:?}",
+                    url,
+                    easy.response_code(),
+                    result
+                );
+            })
+            .unwrap();
     }
-
+    event_loop.run().unwrap();
     Ok(())
 }

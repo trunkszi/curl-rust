@@ -1,9 +1,9 @@
 use std::env;
 use std::fs::File;
-use std::io::{stdout, Read, Write};
+use std::io::{Read, Write, stdout};
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use curl::easy::Easy;
 
 fn read_file(path: impl AsRef<Path>) -> Result<Vec<u8>> {
@@ -58,6 +58,8 @@ fn main() -> Result<()> {
         handle.ssl_cainfo_blob(&ca_blob)?;
     }
 
-    handle.perform()?;
+    let mut event_loop = curl::EventLoop::new().unwrap();
+    event_loop.add(handle, |_, _| {}).unwrap();
+    event_loop.run().unwrap();
     Ok(())
 }

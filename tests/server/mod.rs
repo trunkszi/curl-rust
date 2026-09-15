@@ -1,11 +1,11 @@
 #![allow(dead_code)]
 
 use std::collections::HashSet;
-use std::io::prelude::*;
 use std::io::BufReader;
+use std::io::prelude::*;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
 pub struct Server {
@@ -147,7 +147,6 @@ impl Server {
         }
     }
 
-    #[cfg(not(windows))]
     pub fn new_unix() -> Server {
         use std::os::unix::net::UnixListener;
 
@@ -189,7 +188,6 @@ impl Server {
         }
     }
 
-    #[cfg(not(windows))]
     pub fn path(&self) -> &str {
         match &self.addr {
             Addr::Tcp(_) => panic!("server is a TcpListener"),
@@ -200,7 +198,9 @@ impl Server {
     pub fn url(&self, path: &str) -> String {
         match &self.addr {
             Addr::Tcp(addr) => format!("http://{}{}", addr, path),
-            Addr::Unix(_) => format!("http://localhost{}", path),
+            // The socket path controls where curl connects; keep the URL host
+            // an IP literal so EventLoop never has to resolve a hostname.
+            Addr::Unix(_) => format!("http://127.0.0.1{}", path),
         }
     }
 }

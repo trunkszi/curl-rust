@@ -6,25 +6,14 @@
 extern crate libnghttp2_sys;
 #[cfg(link_libz)]
 extern crate libz_sys;
-#[cfg(link_openssl)]
-extern crate openssl_sys;
-#[cfg(feature = "rustls")]
+
 extern crate rustls_ffi;
 
 use libc::c_ulong;
 use libc::{c_char, c_double, c_int, c_long, c_short, c_uint, c_void, size_t, time_t};
 
-#[cfg(unix)]
 pub use libc::fd_set;
-#[cfg(windows)]
-pub use windows_sys::Win32::Networking::WinSock::FD_SET as fd_set;
-#[cfg(windows)]
-use windows_sys::Win32::Networking::WinSock::SOCKADDR;
 
-#[cfg(target_env = "msvc")]
-#[doc(hidden)]
-pub type __enum_ty = libc::c_int;
-#[cfg(not(target_env = "msvc"))]
 #[doc(hidden)]
 pub type __enum_ty = libc::c_uint;
 
@@ -34,17 +23,33 @@ pub type CURLcode = __enum_ty;
 pub type CURLversion = __enum_ty;
 pub type curl_off_t = i64;
 
+#[repr(C)]
+pub struct curl_ws_frame {
+    pub age: c_int,
+    pub flags: c_int,
+    pub offset: curl_off_t,
+    pub bytesleft: curl_off_t,
+    pub len: size_t,
+}
+pub const CURLWS_TEXT: c_int = 1;
+pub const CURLWS_BINARY: c_int = 2;
+pub const CURLWS_CONT: c_int = 4;
+pub const CURLWS_CLOSE: c_int = 8;
+pub const CURLWS_PING: c_int = 16;
+pub const CURLWS_PONG: c_int = 64;
+pub const CURLWS_OFFSET: c_int = 32;
+pub const CURLWS_RAW_MODE: c_long = 1;
+pub const CURLWS_NOAUTOPONG: c_long = 2;
+
 pub enum CURL {}
 
-#[cfg(unix)]
 pub type curl_socket_t = libc::c_int;
-#[cfg(unix)]
 pub const CURL_SOCKET_BAD: curl_socket_t = -1;
-#[cfg(all(windows, target_pointer_width = "32"))]
+#[cfg(any())]
 pub type curl_socket_t = libc::c_uint;
-#[cfg(all(windows, target_pointer_width = "64"))]
+#[cfg(any())]
 pub type curl_socket_t = u64;
-#[cfg(windows)]
+#[cfg(any())]
 pub const CURL_SOCKET_BAD: curl_socket_t = !0;
 
 pub enum curl_httppost {
@@ -311,9 +316,11 @@ pub const CURLAUTH_NTLM: c_ulong = 1 << 3;
 pub const CURLAUTH_DIGEST_IE: c_ulong = 1 << 4;
 pub const CURLAUTH_NTLM_WB: c_ulong = 1 << 5;
 pub const CURLAUTH_AWS_SIGV4: c_ulong = 1 << 7;
+pub const CURLAUTH_HTTPSIG: c_ulong = 1 << 8;
 // pub const CURLAUTH_ONLY: c_ulong = 1 << 31;
-pub const CURLAUTH_ANY: c_ulong = (!CURLAUTH_DIGEST_IE) & 0xffffffff;
-pub const CURLAUTH_ANYSAFE: c_ulong = (!(CURLAUTH_BASIC | CURLAUTH_DIGEST_IE)) & 0xffffffff;
+pub const CURLAUTH_ANY: c_ulong = (!(CURLAUTH_DIGEST_IE | CURLAUTH_HTTPSIG)) & 0xffffffff;
+pub const CURLAUTH_ANYSAFE: c_ulong =
+    (!(CURLAUTH_BASIC | CURLAUTH_DIGEST_IE | CURLAUTH_HTTPSIG)) & 0xffffffff;
 
 // pub const CURLSSH_AUTH_ANY: c_ulong = !0;
 // pub const CURLSSH_AUTH_NONE: c_ulong = 0;
@@ -504,6 +511,7 @@ pub const CURLOPT_FTP_FILEMETHOD: CURLoption = CURLOPTTYPE_LONG + 138;
 pub const CURLOPT_LOCALPORT: CURLoption = CURLOPTTYPE_LONG + 139;
 pub const CURLOPT_LOCALPORTRANGE: CURLoption = CURLOPTTYPE_LONG + 140;
 pub const CURLOPT_CONNECT_ONLY: CURLoption = CURLOPTTYPE_LONG + 141;
+pub const CURLOPT_WS_OPTIONS: CURLoption = CURLOPTTYPE_LONG + 320;
 pub const CURLOPT_CONV_FROM_NETWORK_FUNCTION: CURLoption = CURLOPTTYPE_FUNCTIONPOINT + 142;
 pub const CURLOPT_CONV_TO_NETWORK_FUNCTION: CURLoption = CURLOPTTYPE_FUNCTIONPOINT + 143;
 pub const CURLOPT_CONV_FROM_UTF8_FUNCTION: CURLoption = CURLOPTTYPE_FUNCTIONPOINT + 144;
@@ -798,6 +806,8 @@ pub const CURLINFO_NUM_CONNECTS: CURLINFO = CURLINFO_LONG + 26;
 pub const CURLINFO_SSL_ENGINES: CURLINFO = CURLINFO_SLIST + 27;
 pub const CURLINFO_COOKIELIST: CURLINFO = CURLINFO_SLIST + 28;
 pub const CURLINFO_LASTSOCKET: CURLINFO = CURLINFO_LONG + 29;
+pub const CURLINFO_SOCKET: CURLINFO = 0x500000;
+pub const CURLINFO_ACTIVESOCKET: CURLINFO = CURLINFO_SOCKET + 44;
 pub const CURLINFO_FTP_ENTRY_PATH: CURLINFO = CURLINFO_STRING + 30;
 pub const CURLINFO_REDIRECT_URL: CURLINFO = CURLINFO_STRING + 31;
 pub const CURLINFO_PRIMARY_IP: CURLINFO = CURLINFO_STRING + 32;
@@ -1027,9 +1037,8 @@ pub struct curl_sockaddr {
     pub socktype: c_int,
     pub protocol: c_int,
     pub addrlen: c_uint,
-    #[cfg(unix)]
     pub addr: libc::sockaddr,
-    #[cfg(windows)]
+    #[cfg(any())]
     pub addr: SOCKADDR,
 }
 
@@ -1103,8 +1112,24 @@ extern "C" {
         buflen: size_t,
         n: *mut size_t,
     ) -> CURLcode;
+    pub fn curl_ws_recv(
+        curl: *mut CURL,
+        buffer: *mut c_void,
+        buflen: size_t,
+        n: *mut size_t,
+        meta: *mut *const curl_ws_frame,
+    ) -> CURLcode;
+    pub fn curl_ws_send(
+        curl: *mut CURL,
+        buffer: *const c_void,
+        buflen: size_t,
+        n: *mut size_t,
+        fragsize: curl_off_t,
+        flags: c_uint,
+    ) -> CURLcode;
+    pub fn curl_ws_meta(curl: *mut CURL) -> *const curl_ws_frame;
+    pub fn curl_ws_start_frame(curl: *mut CURL, flags: c_uint, frame_len: curl_off_t) -> CURLcode;
 
-    #[cfg(feature = "upkeep_7_62_0")]
     pub fn curl_easy_upkeep(curl: *mut CURL) -> CURLcode;
 
     pub fn curl_multi_init() -> *mut CURLM;
@@ -1125,7 +1150,6 @@ extern "C" {
         ret: *mut c_int,
     ) -> CURLMcode;
 
-    #[cfg(feature = "poll_7_68_0")]
     pub fn curl_multi_poll(
         multi_handle: *mut CURLM,
         extra_fds: *mut curl_waitfd,
@@ -1134,7 +1158,6 @@ extern "C" {
         ret: *mut c_int,
     ) -> CURLMcode;
 
-    #[cfg(feature = "poll_7_68_0")]
     pub fn curl_multi_wakeup(multi_handle: *mut CURLM) -> CURLMcode;
 
     pub fn curl_multi_perform(multi_handle: *mut CURLM, running_handles: *mut c_int) -> CURLMcode;

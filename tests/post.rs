@@ -1,3 +1,4 @@
+mod support;
 use curl::Version;
 use std::time::Duration;
 
@@ -60,10 +61,9 @@ fn custom() {
     t!(form.part("foo").contents(b"1234").add());
     t!(handle.url(&s.url("/")));
     t!(handle.httppost(form));
-    t!(handle.perform());
+    t!(support::perform(&mut handle));
 }
 
-#[cfg(feature = "static-curl")]
 #[test]
 fn buffer() {
     let s = Server::new();
@@ -94,10 +94,9 @@ fn buffer() {
         .add());
     t!(handle.url(&s.url("/")));
     t!(handle.httppost(form));
-    t!(handle.perform());
+    t!(support::perform(&mut handle));
 }
 
-#[cfg(feature = "static-curl")]
 #[test]
 fn file() {
     let s = Server::new();
@@ -130,5 +129,5 @@ fn file() {
     t!(form.part("foo").file("tests/formdata").add());
     t!(handle.url(&s.url("/")));
     t!(handle.httppost(form));
-    t!(handle.perform());
+    t!(support::perform(&mut handle));
 }

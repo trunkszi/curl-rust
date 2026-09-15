@@ -9,9 +9,6 @@ pub struct Version {
     inner: *mut curl_sys::curl_version_info_data,
 }
 
-unsafe impl Send for Version {}
-unsafe impl Sync for Version {}
-
 /// An iterator over the list of protocols a version supports.
 #[derive(Clone)]
 pub struct Protocols<'a> {
@@ -37,7 +34,7 @@ impl Version {
         }
     }
 
-    /// Returns the human readable version string,
+    /// Returns the human-readable version string,
     pub fn version(&self) -> &str {
         unsafe { crate::opt_str((*self.inner).version).unwrap() }
     }
@@ -55,7 +52,7 @@ impl Version {
         curl_sys::vendored()
     }
 
-    /// Returns a human readable string of the host libcurl is built for.
+    /// Returns a human-readable string of the host libcurl is built for.
     ///
     /// This is discovered as part of the build environment.
     pub fn host(&self) -> &str {
@@ -116,6 +113,14 @@ impl Version {
     /// Returns whether libcurl was built with asynchronous name lookups.
     pub fn feature_async_dns(&self) -> bool {
         self.flag(curl_sys::CURL_VERSION_ASYNCHDNS)
+    }
+
+    /// Returns whether WebSocket support is available.
+    pub fn feature_websockets(&self) -> bool {
+        // libcurl exposes WebSocket support through the API, but does not
+        // publish a dedicated CURL_VERSION_* feature bit. This crate always
+        // builds the vendored WebSocket implementation.
+        true
     }
 
     /// Returns whether libcurl was built with support for character
@@ -358,7 +363,7 @@ impl Version {
         }
     }
 
-    /// If available, the human readable version of zstd
+    /// If available, the human-readable version of zstd
     pub fn zstd_version(&self) -> Option<&str> {
         unsafe {
             if (*self.inner).age >= curl_sys::CURLVERSION_EIGHTH {
@@ -369,7 +374,7 @@ impl Version {
         }
     }
 
-    /// If available, the human readable version of hyper
+    /// If available, the human-readable version of hyper
     pub fn hyper_version(&self) -> Option<&str> {
         unsafe {
             if (*self.inner).age >= curl_sys::CURLVERSION_NINTH {
@@ -380,7 +385,7 @@ impl Version {
         }
     }
 
-    /// If available, the human readable version of hyper
+    /// If available, the human-readable version of hyper
     pub fn gsasl_version(&self) -> Option<&str> {
         unsafe {
             if (*self.inner).age >= curl_sys::CURLVERSION_TENTH {

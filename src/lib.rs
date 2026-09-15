@@ -27,7 +27,9 @@
 //!     stdout().write_all(data).unwrap();
 //!     Ok(data.len())
 //! }).unwrap();
-//! easy.perform().unwrap();
+//! let mut event_loop = curl::EventLoop::new().unwrap();
+//! event_loop.add(easy, |_, _| {}).unwrap();
+//! event_loop.run().unwrap();
 //! ```
 //!
 //! # What about multiple concurrent HTTP requests?
@@ -55,6 +57,15 @@
 
 #![deny(missing_docs, missing_debug_implementations)]
 #![doc(html_root_url = "https://docs.rs/curl/0.4")]
+
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_os = "linux", target_env = "gnu"),
+    all(target_arch = "x86_64", target_os = "linux", target_env = "musl"),
+    all(target_arch = "x86_64", target_os = "macos"),
+)))]
+compile_error!(
+    "curl-rust supports only x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl, and x86_64-apple-darwin"
+);
 
 use std::ffi::CStr;
 use std::str;
@@ -94,11 +105,6 @@ pub fn init() {
     static INIT: Once = Once::new();
 
     INIT.call_once(|| {
-        #[cfg(need_openssl_init)]
-        openssl_probe::init_ssl_cert_env_vars();
-        #[cfg(need_openssl_init)]
-        openssl_sys::init();
-
         unsafe {
             assert_eq!(curl_sys::curl_global_init(curl_sys::CURL_GLOBAL_ALL), 0);
         }
@@ -133,15 +139,14 @@ pub fn init() {
 #[doc(hidden)]
 #[cfg_attr(
     any(target_os = "linux", target_os = "freebsd", target_os = "android"),
-    link_section = ".init_array"
+    unsafe(link_section = ".init_array")
 )]
-#[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_init_func")]
-#[cfg_attr(target_os = "windows", link_section = ".CRT$XCU")]
+#[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
 pub static INIT_CTOR: extern "C" fn() = {
     /// This is the body of our constructor function.
     #[cfg_attr(
         any(target_os = "linux", target_os = "android"),
-        link_section = ".text.startup"
+        unsafe(link_section = ".text.startup")
     )]
     extern "C" fn init_ctor() {
         init();
@@ -154,7 +159,7 @@ unsafe fn opt_str<'a>(ptr: *const libc::c_char) -> Option<&'a str> {
     if ptr.is_null() {
         None
     } else {
-        Some(str::from_utf8(CStr::from_ptr(ptr).to_bytes()).unwrap())
+        Some(str::from_utf8(unsafe { CStr::from_ptr(ptr) }.to_bytes()).unwrap())
     }
 }
 
@@ -174,7 +179,7 @@ mod tests {
     #[cfg(any(
         target_os = "linux",
         target_os = "macos",
-        target_os = "windows",
+        target_os = "linux",
         target_os = "freebsd",
         target_os = "android"
     ))]
@@ -182,3 +187,10 @@ mod tests {
         assert!(INITIALIZED.load(std::sync::atomic::Ordering::SeqCst));
     }
 }
+
+pub mod event_loop;
+pub(crate) mod reactor;
+pub mod websocket;
+pub use event_loop::{EventLoop, Token, WatchEvents, WatchToken};
+
+pub mod http;

@@ -3,6 +3,8 @@ use std::convert::TryFrom;
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::io::{self, SeekFrom, Write};
+use std::marker::PhantomData;
+use std::net::IpAddr;
 use std::path::Path;
 use std::ptr;
 use std::slice;
@@ -12,291 +14,21 @@ use std::time::Duration;
 use libc::{c_char, c_double, c_int, c_long, c_ulong, c_void, size_t};
 use socket2::Socket;
 
+use crate::Error;
 use crate::easy::form;
 use crate::easy::list;
-use crate::easy::windows;
 use crate::easy::{Form, List};
 use crate::panic;
-use crate::Error;
 
-/// A trait for the various callbacks used by libcurl to invoke user code.
-///
-/// This trait represents all operations that libcurl can possibly invoke a
-/// client for code during an HTTP transaction. Each callback has a default
-/// "noop" implementation, the same as in libcurl. Types implementing this trait
-/// may simply override the relevant functions to learn about the callbacks
-/// they're interested in.
-///
-/// # Examples
-///
-/// ```
-/// use curl::easy::{Easy2, Handler, WriteError};
-///
-/// struct Collector(Vec<u8>);
-///
-/// impl Handler for Collector {
-///     fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
-///         self.0.extend_from_slice(data);
-///         Ok(data.len())
-///     }
-/// }
-///
-/// let mut easy = Easy2::new(Collector(Vec::new()));
-/// easy.get(true).unwrap();
-/// easy.url("https://rust-lang.org/").unwrap();
-/// easy.perform().unwrap();
-///
-/// assert_eq!(easy.response_code().unwrap(), 200);
-/// let contents = easy.get_ref();
-/// println!("{}", String::from_utf8_lossy(&contents.0));
-/// ```
-pub trait Handler {
-    /// Callback invoked whenever curl has downloaded data for the application.
-    ///
-    /// This callback function gets called by libcurl as soon as there is data
-    /// received that needs to be saved.
-    ///
-    /// The callback function will be passed as much data as possible in all
-    /// invokes, but you must not make any assumptions. It may be one byte, it
-    /// may be thousands. If `show_header` is enabled, which makes header data
-    /// get passed to the write callback, you can get up to
-    /// `CURL_MAX_HTTP_HEADER` bytes of header data passed into it.  This
-    /// usually means 100K.
-    ///
-    /// This function may be called with zero bytes data if the transferred file
-    /// is empty.
-    ///
-    /// The callback should return the number of bytes actually taken care of.
-    /// If that amount differs from the amount passed to your callback function,
-    /// it'll signal an error condition to the library. This will cause the
-    /// transfer to get aborted and the libcurl function used will return
-    /// an error with `is_write_error`.
-    ///
-    /// If your callback function returns `Err(WriteError::Pause)` it will cause
-    /// this transfer to become paused. See `unpause_write` for further details.
-    ///
-    /// By default data is sent into the void, and this corresponds to the
-    /// `CURLOPT_WRITEFUNCTION` and `CURLOPT_WRITEDATA` options.
-    fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
-        Ok(data.len())
-    }
-
-    /// Read callback for data uploads.
-    ///
-    /// This callback function gets called by libcurl as soon as it needs to
-    /// read data in order to send it to the peer - like if you ask it to upload
-    /// or post data to the server.
-    ///
-    /// Your function must then return the actual number of bytes that it stored
-    /// in that memory area. Returning 0 will signal end-of-file to the library
-    /// and cause it to stop the current transfer.
-    ///
-    /// If you stop the current transfer by returning 0 "pre-maturely" (i.e
-    /// before the server expected it, like when you've said you will upload N
-    /// bytes and you upload less than N bytes), you may experience that the
-    /// server "hangs" waiting for the rest of the data that won't come.
-    ///
-    /// The read callback may return `Err(ReadError::Abort)` to stop the
-    /// current operation immediately, resulting in a `is_aborted_by_callback`
-    /// error code from the transfer.
-    ///
-    /// The callback can return `Err(ReadError::Pause)` to cause reading from
-    /// this connection to pause. See `unpause_read` for further details.
-    ///
-    /// By default data not input, and this corresponds to the
-    /// `CURLOPT_READFUNCTION` and `CURLOPT_READDATA` options.
-    ///
-    /// Note that the lifetime bound on this function is `'static`, but that
-    /// is often too restrictive. To use stack data consider calling the
-    /// `transfer` method and then using `read_function` to configure a
-    /// callback that can reference stack-local data.
-    fn read(&mut self, data: &mut [u8]) -> Result<usize, ReadError> {
-        let _ = data; // ignore unused
-        Ok(0)
-    }
-
-    /// User callback for seeking in input stream.
-    ///
-    /// This function gets called by libcurl to seek to a certain position in
-    /// the input stream and can be used to fast forward a file in a resumed
-    /// upload (instead of reading all uploaded bytes with the normal read
-    /// function/callback). It is also called to rewind a stream when data has
-    /// already been sent to the server and needs to be sent again. This may
-    /// happen when doing a HTTP PUT or POST with a multi-pass authentication
-    /// method, or when an existing HTTP connection is reused too late and the
-    /// server closes the connection.
-    ///
-    /// The callback function must return `SeekResult::Ok` on success,
-    /// `SeekResult::Fail` to cause the upload operation to fail or
-    /// `SeekResult::CantSeek` to indicate that while the seek failed, libcurl
-    /// is free to work around the problem if possible. The latter can sometimes
-    /// be done by instead reading from the input or similar.
-    ///
-    /// By default data this option is not set, and this corresponds to the
-    /// `CURLOPT_SEEKFUNCTION` and `CURLOPT_SEEKDATA` options.
-    fn seek(&mut self, whence: SeekFrom) -> SeekResult {
-        let _ = whence; // ignore unused
-        SeekResult::CantSeek
-    }
-
-    /// Specify a debug callback
-    ///
-    /// `debug_function` replaces the standard debug function used when
-    /// `verbose` is in effect. This callback receives debug information,
-    /// as specified in the type argument.
-    ///
-    /// By default this option is not set and corresponds to the
-    /// `CURLOPT_DEBUGFUNCTION` and `CURLOPT_DEBUGDATA` options.
-    fn debug(&mut self, kind: InfoType, data: &[u8]) {
-        debug(kind, data)
-    }
-
-    /// Callback that receives header data
-    ///
-    /// This function gets called by libcurl as soon as it has received header
-    /// data. The header callback will be called once for each header and only
-    /// complete header lines are passed on to the callback. Parsing headers is
-    /// very easy using this. If this callback returns `false` it'll signal an
-    /// error to the library. This will cause the transfer to get aborted and
-    /// the libcurl function in progress will return `is_write_error`.
-    ///
-    /// A complete HTTP header that is passed to this function can be up to
-    /// CURL_MAX_HTTP_HEADER (100K) bytes.
-    ///
-    /// It's important to note that the callback will be invoked for the headers
-    /// of all responses received after initiating a request and not just the
-    /// final response. This includes all responses which occur during
-    /// authentication negotiation. If you need to operate on only the headers
-    /// from the final response, you will need to collect headers in the
-    /// callback yourself and use HTTP status lines, for example, to delimit
-    /// response boundaries.
-    ///
-    /// When a server sends a chunked encoded transfer, it may contain a
-    /// trailer. That trailer is identical to a HTTP header and if such a
-    /// trailer is received it is passed to the application using this callback
-    /// as well. There are several ways to detect it being a trailer and not an
-    /// ordinary header: 1) it comes after the response-body. 2) it comes after
-    /// the final header line (CR LF) 3) a Trailer: header among the regular
-    /// response-headers mention what header(s) to expect in the trailer.
-    ///
-    /// For non-HTTP protocols like FTP, POP3, IMAP and SMTP this function will
-    /// get called with the server responses to the commands that libcurl sends.
-    ///
-    /// By default this option is not set and corresponds to the
-    /// `CURLOPT_HEADERFUNCTION` and `CURLOPT_HEADERDATA` options.
-    fn header(&mut self, data: &[u8]) -> bool {
-        let _ = data; // ignore unused
-        true
-    }
-
-    /// Callback to progress meter function
-    ///
-    /// This function gets called by libcurl instead of its internal equivalent
-    /// with a frequent interval. While data is being transferred it will be
-    /// called very frequently, and during slow periods like when nothing is
-    /// being transferred it can slow down to about one call per second.
-    ///
-    /// The callback gets told how much data libcurl will transfer and has
-    /// transferred, in number of bytes. The first argument is the total number
-    /// of bytes libcurl expects to download in this transfer. The second
-    /// argument is the number of bytes downloaded so far. The third argument is
-    /// the total number of bytes libcurl expects to upload in this transfer.
-    /// The fourth argument is the number of bytes uploaded so far.
-    ///
-    /// Unknown/unused argument values passed to the callback will be set to
-    /// zero (like if you only download data, the upload size will remain 0).
-    /// Many times the callback will be called one or more times first, before
-    /// it knows the data sizes so a program must be made to handle that.
-    ///
-    /// Returning `false` from this callback will cause libcurl to abort the
-    /// transfer and return `is_aborted_by_callback`.
-    ///
-    /// If you transfer data with the multi interface, this function will not be
-    /// called during periods of idleness unless you call the appropriate
-    /// libcurl function that performs transfers.
-    ///
-    /// `progress` must be set to `true` to make this function actually get
-    /// called.
-    ///
-    /// By default this function calls an internal method and corresponds to
-    /// `CURLOPT_PROGRESSFUNCTION` and `CURLOPT_PROGRESSDATA`.
-    fn progress(&mut self, dltotal: f64, dlnow: f64, ultotal: f64, ulnow: f64) -> bool {
-        let _ = (dltotal, dlnow, ultotal, ulnow); // ignore unused
-        true
-    }
-
-    /// Callback to SSL context
-    ///
-    /// This callback function gets called by libcurl just before the
-    /// initialization of an SSL connection after having processed all
-    /// other SSL related options to give a last chance to an
-    /// application to modify the behaviour of the SSL
-    /// initialization. The `ssl_ctx` parameter is actually a pointer
-    /// to the SSL library's SSL_CTX. If an error is returned from the
-    /// callback no attempt to establish a connection is made and the
-    /// perform operation will return the callback's error code.
-    ///
-    /// This function will get called on all new connections made to a
-    /// server, during the SSL negotiation. The SSL_CTX pointer will
-    /// be a new one every time.
-    ///
-    /// To use this properly, a non-trivial amount of knowledge of
-    /// your SSL library is necessary. For example, you can use this
-    /// function to call library-specific callbacks to add additional
-    /// validation code for certificates, and even to change the
-    /// actual URI of a HTTPS request.
-    ///
-    /// By default this function calls an internal method and
-    /// corresponds to `CURLOPT_SSL_CTX_FUNCTION` and
-    /// `CURLOPT_SSL_CTX_DATA`.
-    ///
-    /// Note that this callback is not guaranteed to be called, not all versions
-    /// of libcurl support calling this callback.
-    fn ssl_ctx(&mut self, cx: *mut c_void) -> Result<(), Error> {
-        // By default, if we're on an OpenSSL enabled libcurl and we're on
-        // Windows, add the system's certificate store to OpenSSL's certificate
-        // store.
-        ssl_ctx(cx)
-    }
-
-    /// Callback to open sockets for libcurl.
-    ///
-    /// This callback function gets called by libcurl instead of the socket(2)
-    /// call. The callback function should return the newly created socket
-    /// or `None` in case no connection could be established or another
-    /// error was detected. Any additional `setsockopt(2)` calls can of course
-    /// be done on the socket at the user's discretion. A `None` return
-    /// value from the callback function will signal an unrecoverable error to
-    /// libcurl and it will return `is_couldnt_connect` from the function that
-    /// triggered this callback.
-    ///
-    /// By default this function opens a standard socket and
-    /// corresponds to `CURLOPT_OPENSOCKETFUNCTION `.
-    fn open_socket(
-        &mut self,
-        family: c_int,
-        socktype: c_int,
-        protocol: c_int,
-    ) -> Option<curl_sys::curl_socket_t> {
-        // Note that we override this to calling a function in `socket2` to
-        // ensure that we open all sockets with CLOEXEC. Otherwise if we rely on
-        // libcurl to open sockets it won't use CLOEXEC.
-        return Socket::new(family.into(), socktype.into(), Some(protocol.into()))
-            .ok()
-            .map(cvt);
-
-        #[cfg(unix)]
-        fn cvt(socket: Socket) -> curl_sys::curl_socket_t {
-            use std::os::unix::prelude::*;
-            socket.into_raw_fd()
-        }
-
-        #[cfg(windows)]
-        fn cvt(socket: Socket) -> curl_sys::curl_socket_t {
-            use std::os::windows::prelude::*;
-            socket.into_raw_socket()
-        }
-    }
+pub(super) fn open_socket(
+    family: c_int,
+    socktype: c_int,
+    protocol: c_int,
+) -> Option<curl_sys::curl_socket_t> {
+    use std::os::fd::IntoRawFd;
+    Socket::new(family.into(), socktype.into(), Some(protocol.into()))
+        .ok()
+        .map(IntoRawFd::into_raw_fd)
 }
 
 pub fn debug(kind: InfoType, data: &[u8]) {
@@ -316,113 +48,88 @@ pub fn debug(kind: InfoType, data: &[u8]) {
     }
 }
 
-pub fn ssl_ctx(cx: *mut c_void) -> Result<(), Error> {
-    windows::add_certs_to_context(cx);
-    Ok(())
+/// A single-thread libcurl session configured with owned closures.
+///
+/// Callbacks may capture `Rc<RefCell<T>>` for shared state. Handles and their
+/// callbacks remain on the creating thread.
+///
+/// This value cannot move to another thread:
+/// ```compile_fail
+/// let value = curl::easy::Easy::new();
+/// std::thread::spawn(move || drop(value));
+/// ```
+/// It cannot be shared across threads through `Arc`:
+/// ```compile_fail
+/// let value = std::sync::Arc::new(curl::easy::Easy::new());
+/// std::thread::spawn(move || drop(value));
+/// ```
+pub struct Easy {
+    pub(crate) inner: Box<Inner>,
+    _marker: PhantomData<*mut ()>,
 }
 
-/// Raw bindings to a libcurl "easy session".
-///
-/// This type corresponds to the `CURL` type in libcurl, and is probably what
-/// you want for just sending off a simple HTTP request and fetching a response.
-/// Each easy handle can be thought of as a large builder before calling the
-/// final `perform` function.
-///
-/// There are many many configuration options for each `Easy2` handle, and they
-/// should all have their own documentation indicating what it affects and how
-/// it interacts with other options. Some implementations of libcurl can use
-/// this handle to interact with many different protocols, although by default
-/// this crate only guarantees the HTTP/HTTPS protocols working.
-///
-/// Note that almost all methods on this structure which configure various
-/// properties return a `Result`. This is largely used to detect whether the
-/// underlying implementation of libcurl actually implements the option being
-/// requested. If you're linked to a version of libcurl which doesn't support
-/// the option, then an error will be returned. Some options also perform some
-/// validation when they're set, and the error is returned through this vector.
-///
-/// Note that historically this library contained an `Easy` handle so this one's
-/// called `Easy2`. The major difference between the `Easy` type is that an
-/// `Easy2` structure uses a trait instead of closures for all of the callbacks
-/// that curl can invoke. The `Easy` type is actually built on top of this
-/// `Easy` type, and this `Easy2` type can be more flexible in some situations
-/// due to the generic parameter.
-///
-/// There's not necessarily a right answer for which type is correct to use, but
-/// as a general rule of thumb `Easy` is typically a reasonable choice for
-/// synchronous I/O and `Easy2` is a good choice for asynchronous I/O.
-///
-/// # Examples
-///
-/// ```
-/// use curl::easy::{Easy2, Handler, WriteError};
-///
-/// struct Collector(Vec<u8>);
-///
-/// impl Handler for Collector {
-///     fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
-///         self.0.extend_from_slice(data);
-///         Ok(data.len())
-///     }
-/// }
-///
-/// let mut easy = Easy2::new(Collector(Vec::new()));
-/// easy.get(true).unwrap();
-/// easy.url("https://rust-lang.org/").unwrap();
-/// easy.perform().unwrap();
-///
-/// assert_eq!(easy.response_code().unwrap(), 200);
-/// let contents = easy.get_ref();
-/// println!("{}", String::from_utf8_lossy(&contents.0));
-/// ```
-pub struct Easy2<H> {
-    inner: Box<Inner<H>>,
-}
-
-struct Inner<H> {
+pub(crate) struct Inner {
     handle: *mut curl_sys::CURL,
-    header_list: Option<List>,
+    pub(crate) header_list: Option<List>,
     resolve_list: Option<List>,
     connect_to_list: Option<List>,
     proxy_header_list: Option<List>,
     form: Option<Form>,
     error_buf: RefCell<Vec<u8>>,
-    handler: H,
+    callbacks: Callbacks,
+    pub(crate) configured_url: Option<String>,
+    pub(crate) configured_port: Option<u16>,
+    pub(crate) proxy_url: Option<String>,
+    pub(crate) proxy_port: Option<u16>,
+    pub(crate) resolved_hosts: Vec<(String, u16)>,
+    ssl_options: c_long,
+    pub(crate) explicit_headers: bool,
+    pub(crate) explicit_proxy: bool,
+    pub(crate) explicit_timeout: bool,
+    pub(crate) explicit_cainfo: bool,
 }
-
-unsafe impl<H: Send> Send for Inner<H> {}
 
 /// Possible proxy types that libcurl currently understands.
 #[non_exhaustive]
-#[allow(missing_docs)]
 #[derive(Debug, Clone, Copy)]
 pub enum ProxyType {
+    /// Selects the Http option.
     Http = curl_sys::CURLPROXY_HTTP as isize,
+    /// Selects the Http1 option.
     Http1 = curl_sys::CURLPROXY_HTTP_1_0 as isize,
+    /// Selects the Socks4 option.
     Socks4 = curl_sys::CURLPROXY_SOCKS4 as isize,
+    /// Selects the Socks5 option.
     Socks5 = curl_sys::CURLPROXY_SOCKS5 as isize,
+    /// Selects the Socks4a option.
     Socks4a = curl_sys::CURLPROXY_SOCKS4A as isize,
+    /// Selects the Socks5Hostname option.
     Socks5Hostname = curl_sys::CURLPROXY_SOCKS5_HOSTNAME as isize,
 }
 
 /// Possible conditions for the `time_condition` method.
 #[non_exhaustive]
-#[allow(missing_docs)]
 #[derive(Debug, Clone, Copy)]
 pub enum TimeCondition {
+    /// Selects the None option.
     None = curl_sys::CURL_TIMECOND_NONE as isize,
+    /// Selects the IfModifiedSince option.
     IfModifiedSince = curl_sys::CURL_TIMECOND_IFMODSINCE as isize,
+    /// Selects the IfUnmodifiedSince option.
     IfUnmodifiedSince = curl_sys::CURL_TIMECOND_IFUNMODSINCE as isize,
+    /// Selects the LastModified option.
     LastModified = curl_sys::CURL_TIMECOND_LASTMOD as isize,
 }
 
 /// Possible values to pass to the `ip_resolve` method.
 #[non_exhaustive]
-#[allow(missing_docs)]
 #[derive(Debug, Clone, Copy)]
 pub enum IpResolve {
+    /// Selects the V4 option.
     V4 = curl_sys::CURL_IPRESOLVE_V4 as isize,
+    /// Selects the V6 option.
     V6 = curl_sys::CURL_IPRESOLVE_V6 as isize,
+    /// Selects the Any option.
     Any = curl_sys::CURL_IPRESOLVE_WHATEVER as isize,
 }
 
@@ -465,16 +172,23 @@ pub enum HttpVersion {
 
 /// Possible values to pass to the `ssl_version` and `ssl_min_max_version` method.
 #[non_exhaustive]
-#[allow(missing_docs)]
 #[derive(Debug, Clone, Copy)]
 pub enum SslVersion {
+    /// Selects the Default option.
     Default = curl_sys::CURL_SSLVERSION_DEFAULT as isize,
+    /// Selects the Tlsv1 option.
     Tlsv1 = curl_sys::CURL_SSLVERSION_TLSv1 as isize,
+    /// Selects the Sslv2 option.
     Sslv2 = curl_sys::CURL_SSLVERSION_SSLv2 as isize,
+    /// Selects the Sslv3 option.
     Sslv3 = curl_sys::CURL_SSLVERSION_SSLv3 as isize,
+    /// Selects the Tlsv10 option.
     Tlsv10 = curl_sys::CURL_SSLVERSION_TLSv1_0 as isize,
+    /// Selects the Tlsv11 option.
     Tlsv11 = curl_sys::CURL_SSLVERSION_TLSv1_1 as isize,
+    /// Selects the Tlsv12 option.
     Tlsv12 = curl_sys::CURL_SSLVERSION_TLSv1_2 as isize,
+    /// Selects the Tlsv13 option.
     Tlsv13 = curl_sys::CURL_SSLVERSION_TLSv1_3 as isize,
 }
 
@@ -540,25 +254,6 @@ pub enum WriteError {
     Pause,
 }
 
-/// Options for `.netrc` parsing.
-#[derive(Debug, Clone, Copy)]
-pub enum NetRc {
-    /// Ignoring `.netrc` file and use information from url
-    ///
-    /// This option is default
-    Ignored = curl_sys::CURL_NETRC_IGNORED as isize,
-
-    /// The  use of your `~/.netrc` file is optional, and information in the URL is to be
-    /// preferred. The file will be scanned for the host and user name (to find the password only)
-    /// or for the host only, to find the first user name and password after that machine, which
-    /// ever information is not specified in the URL.
-    Optional = curl_sys::CURL_NETRC_OPTIONAL as isize,
-
-    /// This value tells the library that use of the file is required, to ignore the information in
-    /// the URL, and to search the file for the host only.
-    Required = curl_sys::CURL_NETRC_REQUIRED as isize,
-}
-
 /// Structure which stores possible authentication methods to get passed to
 /// `http_auth` and `proxy_auth`.
 #[derive(Clone)]
@@ -571,12 +266,131 @@ pub struct Auth {
 pub struct SslOpt {
     bits: c_long,
 }
-/// Structure which stores possible post redirection options to pass to `post_redirections`.
-pub struct PostRedirections {
-    bits: c_ulong,
-}
 
-impl<H: Handler> Easy2<H> {
+impl Easy {
+    pub(crate) fn active_socket(&self) -> Option<i32> {
+        let mut fd: libc::c_int = -1;
+        let rc = unsafe {
+            curl_sys::curl_easy_getinfo(self.inner.handle, curl_sys::CURLINFO_ACTIVESOCKET, &mut fd)
+        };
+        (rc == curl_sys::CURLE_OK && fd >= 0).then_some(fd)
+    }
+    /// Validate every host libcurl could connect to without performing DNS.
+    ///
+    /// This is crate-visible so the event-loop admission seam can enforce the
+    /// application's DNS ownership before handing the handle to libcurl.
+    pub(crate) fn validate_targets(&self) -> bool {
+        fn authority(
+            url: &str,
+            fallback_port: u16,
+            forced_port: Option<u16>,
+        ) -> Option<(String, u16)> {
+            let (scheme, rest) = url.split_once("://")?;
+            let authority = rest.split(['/', '?', '#']).next()?;
+            if authority.is_empty() {
+                return None;
+            }
+            let authority = authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host);
+            let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+                let end = bracketed.find(']')?;
+                let host = &bracketed[..end];
+                let host_for_parse = host.split_once("%25").map_or(host, |(h, _)| h);
+                host_for_parse.parse::<IpAddr>().ok()?;
+                let suffix = &bracketed[end + 1..];
+                let port = suffix
+                    .strip_prefix(':')
+                    .filter(|p| !p.is_empty())
+                    .map_or(Ok(fallback_port), str::parse)
+                    .ok()?;
+                (host.to_ascii_lowercase(), forced_port.unwrap_or(port))
+            } else {
+                let (host, port) = match authority
+                    .rsplit_once(':')
+                    .filter(|(_, p)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+                {
+                    Some((h, p)) => (h, p.parse().ok()?),
+                    None => (authority, fallback_port),
+                };
+                if host.parse::<IpAddr>().is_err() {
+                    if host.is_empty() || host.contains(':') {
+                        return None;
+                    }
+                }
+                (host.to_ascii_lowercase(), forced_port.unwrap_or(port))
+            };
+            let _ = scheme;
+            Some((host, port))
+        }
+
+        fn prepared(target: Option<(String, u16)>, mappings: &[(String, u16)]) -> bool {
+            let Some((host, port)) = target else {
+                return false;
+            };
+            let ip_literal = host
+                .split_once("%25")
+                .map_or(host.as_str(), |(ip, _)| ip)
+                .parse::<IpAddr>()
+                .is_ok();
+            ip_literal
+                || mappings
+                    .iter()
+                    .any(|(mapped, mapped_port)| mapped == &host && mapped_port == &port)
+        }
+
+        let Some(url) = self.inner.configured_url.as_deref() else {
+            return false;
+        };
+        let scheme = url.split_once("://").map_or("", |(s, _)| s);
+        let url_port = self.inner.configured_port.unwrap_or(
+            if scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("wss") {
+                443
+            } else {
+                80
+            },
+        );
+        if !prepared(
+            authority(url, url_port, self.inner.configured_port),
+            &self.inner.resolved_hosts,
+        ) {
+            return false;
+        }
+        let Some(proxy) = self.inner.proxy_url.as_deref().filter(|p| !p.is_empty()) else {
+            return true;
+        };
+        let proxy_scheme = proxy.split_once("://").map_or("", |(s, _)| s);
+        let proxy_port =
+            self.inner
+                .proxy_port
+                .unwrap_or(if proxy_scheme.eq_ignore_ascii_case("https") {
+                    443
+                } else {
+                    1080
+                });
+        let proxy_url = if proxy.contains("://") {
+            proxy.to_owned()
+        } else {
+            format!("proxy://{proxy}")
+        };
+        prepared(
+            authority(&proxy_url, proxy_port, None),
+            &self.inner.resolved_hosts,
+        )
+    }
+
+    /// Preinstall application-resolved addresses for a host and port.
+    pub fn resolve_host(&mut self, host: &str, port: u16, addrs: &[IpAddr]) -> Result<(), Error> {
+        let mut list = List::new();
+        for addr in addrs {
+            list.append(&format!("{host}:{port}:{addr}"))?;
+        }
+        self.resolve(list)?;
+        self.inner
+            .resolved_hosts
+            .push((host.to_ascii_lowercase(), port));
+        Ok(())
+    }
     /// Creates a new "easy" handle which is the core of almost all operations
     /// in libcurl.
     ///
@@ -584,12 +398,13 @@ impl<H: Handler> Easy2<H> {
     /// followed by a call to `perform`. Options are preserved across calls to
     /// `perform` and need to be reset manually (or via the `reset` method) if
     /// this is not desired.
-    pub fn new(handler: H) -> Easy2<H> {
+    pub fn new() -> Easy {
         crate::init();
         unsafe {
             let handle = curl_sys::curl_easy_init();
             assert!(!handle.is_null());
-            let mut ret = Easy2 {
+            let mut ret = Easy {
+                _marker: PhantomData,
                 inner: Box::new(Inner {
                     handle,
                     header_list: None,
@@ -598,7 +413,17 @@ impl<H: Handler> Easy2<H> {
                     proxy_header_list: None,
                     form: None,
                     error_buf: RefCell::new(vec![0; curl_sys::CURL_ERROR_SIZE]),
-                    handler,
+                    callbacks: Callbacks::default(),
+                    configured_url: None,
+                    configured_port: None,
+                    proxy_url: None,
+                    proxy_port: None,
+                    resolved_hosts: Vec::new(),
+                    ssl_options: 0,
+                    explicit_headers: false,
+                    explicit_proxy: false,
+                    explicit_timeout: false,
+                    explicit_cainfo: false,
                 }),
             };
             ret.default_configure();
@@ -612,6 +437,17 @@ impl<H: Handler> Easy2<H> {
     /// created. This does, however, keep live connections, the session id
     /// cache, the dns cache, and cookies.
     pub fn reset(&mut self) {
+        self.inner.configured_url = None;
+        self.inner.configured_port = None;
+        self.inner.proxy_url = None;
+        self.inner.proxy_port = None;
+        self.inner.resolved_hosts.clear();
+        self.inner.explicit_headers = false;
+        self.inner.explicit_proxy = false;
+        self.inner.explicit_timeout = false;
+        self.inner.explicit_cainfo = false;
+        self.inner.header_list = None;
+        self.inner.resolve_list = None;
         unsafe {
             curl_sys::curl_easy_reset(self.inner.handle);
         }
@@ -625,79 +461,56 @@ impl<H: Handler> Easy2<H> {
         )
         .expect("failed to set error buffer");
         let _ = self.signal(false);
-        self.ssl_configure();
+        self.inner.ssl_options = curl_sys::CURLSSLOPT_NATIVE_CA as c_long;
+        let _ = self.setopt_long(curl_sys::CURLOPT_SSL_OPTIONS, self.inner.ssl_options);
 
         let ptr = &*self.inner as *const _ as *const _;
 
-        let cb: extern "C" fn(*mut c_char, size_t, size_t, *mut c_void) -> size_t = header_cb::<H>;
+        let cb: extern "C" fn(*mut c_char, size_t, size_t, *mut c_void) -> size_t = header_cb;
         self.setopt_ptr(curl_sys::CURLOPT_HEADERFUNCTION, cb as *const _)
             .expect("failed to set header callback");
         self.setopt_ptr(curl_sys::CURLOPT_HEADERDATA, ptr)
             .expect("failed to set header callback");
 
-        let cb: curl_sys::curl_write_callback = write_cb::<H>;
+        let cb: curl_sys::curl_write_callback = write_cb;
         self.setopt_ptr(curl_sys::CURLOPT_WRITEFUNCTION, cb as *const _)
             .expect("failed to set write callback");
         self.setopt_ptr(curl_sys::CURLOPT_WRITEDATA, ptr)
             .expect("failed to set write callback");
 
-        let cb: curl_sys::curl_read_callback = read_cb::<H>;
+        let cb: curl_sys::curl_read_callback = read_cb;
         self.setopt_ptr(curl_sys::CURLOPT_READFUNCTION, cb as *const _)
             .expect("failed to set read callback");
         self.setopt_ptr(curl_sys::CURLOPT_READDATA, ptr)
             .expect("failed to set read callback");
 
-        let cb: curl_sys::curl_seek_callback = seek_cb::<H>;
+        let cb: curl_sys::curl_seek_callback = seek_cb;
         self.setopt_ptr(curl_sys::CURLOPT_SEEKFUNCTION, cb as *const _)
             .expect("failed to set seek callback");
         self.setopt_ptr(curl_sys::CURLOPT_SEEKDATA, ptr)
             .expect("failed to set seek callback");
 
-        let cb: curl_sys::curl_progress_callback = progress_cb::<H>;
+        let cb: curl_sys::curl_progress_callback = progress_cb;
         self.setopt_ptr(curl_sys::CURLOPT_PROGRESSFUNCTION, cb as *const _)
             .expect("failed to set progress callback");
         self.setopt_ptr(curl_sys::CURLOPT_PROGRESSDATA, ptr)
             .expect("failed to set progress callback");
 
-        let cb: curl_sys::curl_debug_callback = debug_cb::<H>;
+        let cb: curl_sys::curl_debug_callback = debug_cb;
         self.setopt_ptr(curl_sys::CURLOPT_DEBUGFUNCTION, cb as *const _)
             .expect("failed to set debug callback");
         self.setopt_ptr(curl_sys::CURLOPT_DEBUGDATA, ptr)
             .expect("failed to set debug callback");
 
-        let cb: curl_sys::curl_ssl_ctx_callback = ssl_ctx_cb::<H>;
-        drop(self.setopt_ptr(curl_sys::CURLOPT_SSL_CTX_FUNCTION, cb as *const _));
-        drop(self.setopt_ptr(curl_sys::CURLOPT_SSL_CTX_DATA, ptr));
-
-        let cb: curl_sys::curl_opensocket_callback = opensocket_cb::<H>;
+        let cb: curl_sys::curl_opensocket_callback = opensocket_cb;
         self.setopt_ptr(curl_sys::CURLOPT_OPENSOCKETFUNCTION, cb as *const _)
             .expect("failed to set open socket callback");
         self.setopt_ptr(curl_sys::CURLOPT_OPENSOCKETDATA, ptr)
             .expect("failed to set open socket callback");
     }
-
-    #[cfg(need_openssl_probe)]
-    fn ssl_configure(&mut self) {
-        use std::sync::LazyLock;
-
-        // Probe for certificate stores the first time an easy handle is created,
-        // and re-use the results for subsequent handles.
-        static PROBE: LazyLock<openssl_probe::ProbeResult> =
-            LazyLock::new(|| openssl_probe::probe());
-
-        if let Some(ref path) = PROBE.cert_file {
-            let _ = self.cainfo(path);
-        }
-        if let Some(ref path) = PROBE.cert_dir {
-            let _ = self.capath(path);
-        }
-    }
-
-    #[cfg(not(need_openssl_probe))]
-    fn ssl_configure(&mut self) {}
 }
 
-impl<H> Easy2<H> {
+impl Easy {
     // =========================================================================
     // Behavior options
 
@@ -793,7 +606,7 @@ impl<H> Easy2<H> {
     /// /path/file.sock
     /// ```
     ///
-    /// This function is an alternative to [`Easy2::unix_socket`] that supports
+    /// This function is an alternative to [`Easy::unix_socket`] that supports
     /// non-UTF-8 paths and also supports disabling Unix sockets by setting the
     /// option to `None`.
     ///
@@ -809,7 +622,7 @@ impl<H> Easy2<H> {
 
     /// Provides the ABSTRACT UNIX SOCKET which this handle will work with.
     ///
-    /// This function is an alternative to [`Easy2::unix_socket`] and [`Easy2::unix_socket_path`] that supports
+    /// This function is an alternative to [`Easy::unix_socket`] and [`Easy::unix_socket_path`] that supports
     /// ABSTRACT_UNIX_SOCKET(`man 7 unix` on Linux) address.
     ///
     /// By default this option is not set and corresponds to
@@ -824,16 +637,6 @@ impl<H> Easy2<H> {
 
     // =========================================================================
     // Internal accessors
-
-    /// Acquires a reference to the underlying handler for events.
-    pub fn get_ref(&self) -> &H {
-        &self.inner.handler
-    }
-
-    /// Acquires a reference to the underlying handler for events.
-    pub fn get_mut(&mut self) -> &mut H {
-        &mut self.inner.handler
-    }
 
     // =========================================================================
     // Error options
@@ -867,6 +670,7 @@ impl<H> Easy2<H> {
     /// By default this option is not set and `perform` will not work until it
     /// is set. This option corresponds to `CURLOPT_URL`.
     pub fn url(&mut self, url: &str) -> Result<(), Error> {
+        self.inner.configured_url = Some(url.to_string());
         let url = CString::new(url)?;
         self.setopt_str(curl_sys::CURLOPT_URL, &url)
     }
@@ -874,6 +678,7 @@ impl<H> Easy2<H> {
     /// Configures the port number to connect to, instead of the one specified
     /// in the URL or the default of the protocol.
     pub fn port(&mut self, port: u16) -> Result<(), Error> {
+        self.inner.configured_port = Some(port);
         self.setopt_long(curl_sys::CURLOPT_PORT, port as c_long)
     }
 
@@ -908,7 +713,12 @@ impl<H> Easy2<H> {
     /// By default this option is not set and corresponds to `CURLOPT_PROXY`.
     pub fn proxy(&mut self, url: &str) -> Result<(), Error> {
         let url = CString::new(url)?;
-        self.setopt_str(curl_sys::CURLOPT_PROXY, &url)
+        let result = self.setopt_str(curl_sys::CURLOPT_PROXY, &url);
+        if result.is_ok() {
+            self.inner.proxy_url = Some(url.to_string_lossy().into_owned());
+            self.inner.explicit_proxy = true;
+        }
+        result
     }
 
     /// Provide port number the proxy is listening on.
@@ -916,6 +726,7 @@ impl<H> Easy2<H> {
     /// By default this option is not set (the default port for the proxy
     /// protocol is used) and corresponds to `CURLOPT_PROXYPORT`.
     pub fn proxy_port(&mut self, port: u16) -> Result<(), Error> {
+        self.inner.proxy_port = Some(port);
         self.setopt_long(curl_sys::CURLOPT_PROXYPORT, port as c_long)
     }
 
@@ -1123,25 +934,17 @@ impl<H> Easy2<H> {
     /// To find the DoH server itself, which might be specified using a name,
     /// libcurl will use the default name lookup function. You can bootstrap
     /// that by providing the address for the DoH server with
-    /// [`Easy2::resolve`].
+    /// [`Easy::resolve`].
     ///
     /// Disable DoH use again by setting this option to [`None`].
     ///
     /// By default this option is not set and corresponds to `CURLOPT_DOH_URL`.
-    pub fn doh_url(&mut self, url: Option<&str>) -> Result<(), Error> {
-        if let Some(url) = url {
-            let url = CString::new(url)?;
-            self.setopt_str(curl_sys::CURLOPT_DOH_URL, &url)
-        } else {
-            self.setopt_ptr(curl_sys::CURLOPT_DOH_URL, ptr::null())
-        }
-    }
 
     /// This option tells curl to verify the authenticity of the DoH
     /// (DNS-over-HTTPS) server's certificate. A value of `true` means curl
     /// verifies; `false` means it does not.
     ///
-    /// This option is the DoH equivalent of [`Easy2::ssl_verify_peer`] and only
+    /// This option is the DoH equivalent of [`Easy::ssl_verify_peer`] and only
     /// affects requests to the DoH server.
     ///
     /// When negotiating a TLS or SSL connection, the server sends a certificate
@@ -1151,7 +954,7 @@ impl<H> Easy2<H> {
     /// signatures, rooted in certification authority (CA) certificates you
     /// supply. curl uses a default bundle of CA certificates (the path for that
     /// is determined at build time) and you can specify alternate certificates
-    /// with the [`Easy2::cainfo`] option or the [`Easy2::capath`] option.
+    /// with the [`Easy::cainfo`] option or the [`Easy::capath`] option.
     ///
     /// When `doh_ssl_verify_peer` is enabled, and the verification fails to
     /// prove that the certificate is authentic, the connection fails. When the
@@ -1159,7 +962,7 @@ impl<H> Easy2<H> {
     ///
     /// Authenticating the certificate is not enough to be sure about the
     /// server. You typically also want to ensure that the server is the server
-    /// you mean to be talking to. Use [`Easy2::doh_ssl_verify_host`] for that.
+    /// you mean to be talking to. Use [`Easy::doh_ssl_verify_host`] for that.
     /// The check that the host name in the certificate is valid for the host
     /// name you are connecting to is done independently of the
     /// `doh_ssl_verify_peer` option.
@@ -1179,7 +982,7 @@ impl<H> Easy2<H> {
     /// Tells curl to verify the DoH (DNS-over-HTTPS) server's certificate name
     /// fields against the host name.
     ///
-    /// This option is the DoH equivalent of [`Easy2::ssl_verify_host`] and only
+    /// This option is the DoH equivalent of [`Easy::ssl_verify_host`] and only
     /// affects requests to the DoH server.
     ///
     /// When `doh_ssl_verify_host` is `true`, the SSL certificate provided by
@@ -1194,9 +997,9 @@ impl<H> Easy2<H> {
     /// regardless of the names used in the certificate. Use that ability with
     /// caution!
     ///
-    /// See also [`Easy2::doh_ssl_verify_peer`] to verify the digital signature
+    /// See also [`Easy::doh_ssl_verify_peer`] to verify the digital signature
     /// of the DoH server certificate. If libcurl is built against NSS and
-    /// [`Easy2::doh_ssl_verify_peer`] is `false`, `doh_ssl_verify_host` is also
+    /// [`Easy::doh_ssl_verify_peer`] is `false`, `doh_ssl_verify_host` is also
     /// set to `false` and cannot be overridden.
     ///
     /// By default this option is set to `true` and corresponds to
@@ -1363,10 +1166,6 @@ impl<H> Easy2<H> {
     /// It will override the other auth types you might have set.
     ///
     /// By default this is not set and corresponds to `CURLOPT_AWS_SIGV4`.
-    pub fn aws_sigv4(&mut self, param: &str) -> Result<(), Error> {
-        let param = CString::new(param)?;
-        self.setopt_str(curl_sys::CURLOPT_AWS_SIGV4, &param)
-    }
 
     /// Configures the proxy username to pass as authentication for this
     /// connection.
@@ -1404,9 +1203,6 @@ impl<H> Easy2<H> {
     /// Enable .netrc parsing
     ///
     /// By default the .netrc file is ignored and corresponds to `CURL_NETRC_IGNORED`.
-    pub fn netrc(&mut self, netrc: NetRc) -> Result<(), Error> {
-        self.setopt_long(curl_sys::CURLOPT_NETRC, netrc as c_long)
-    }
 
     // =========================================================================
     // HTTP Options
@@ -1415,9 +1211,6 @@ impl<H> Easy2<H> {
     ///
     /// By default this option is `false` and corresponds to
     /// `CURLOPT_AUTOREFERER`.
-    pub fn autoreferer(&mut self, enable: bool) -> Result<(), Error> {
-        self.setopt_long(curl_sys::CURLOPT_AUTOREFERER, enable as c_long)
-    }
 
     /// Enables automatic decompression of HTTP downloads.
     ///
@@ -1449,9 +1242,6 @@ impl<H> Easy2<H> {
     ///
     /// By default this option is `false` and corresponds to
     /// `CURLOPT_FOLLOWLOCATION`.
-    pub fn follow_location(&mut self, enable: bool) -> Result<(), Error> {
-        self.setopt_long(curl_sys::CURLOPT_FOLLOWLOCATION, enable as c_long)
-    }
 
     /// Send credentials to hosts other than the first as well.
     ///
@@ -1460,9 +1250,6 @@ impl<H> Easy2<H> {
     ///
     /// By default this option is `false` and corresponds to
     /// `CURLOPT_UNRESTRICTED_AUTH`.
-    pub fn unrestricted_auth(&mut self, enable: bool) -> Result<(), Error> {
-        self.setopt_long(curl_sys::CURLOPT_UNRESTRICTED_AUTH, enable as c_long)
-    }
 
     /// Set the maximum number of redirects allowed.
     ///
@@ -1470,18 +1257,11 @@ impl<H> Easy2<H> {
     ///
     /// By default this option is `-1` (unlimited) and corresponds to
     /// `CURLOPT_MAXREDIRS`.
-    pub fn max_redirections(&mut self, max: u32) -> Result<(), Error> {
-        self.setopt_long(curl_sys::CURLOPT_MAXREDIRS, max as c_long)
-    }
 
     /// Set the policy for handling redirects to POST requests.
     ///
     /// By default a POST is changed to a GET when following a redirect. Setting any
-    /// of the `PostRedirections` flags will preserve the POST method for the
     /// selected response codes.
-    pub fn post_redirections(&mut self, redirects: &PostRedirections) -> Result<(), Error> {
-        self.setopt_long(curl_sys::CURLOPT_POSTREDIR, redirects.bits as c_long)
-    }
 
     /// Make an HTTP PUT request.
     ///
@@ -1577,7 +1357,7 @@ impl<H> Easy2<H> {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// use curl::easy::{Easy, List};
     ///
     /// let mut list = List::new();
@@ -1587,12 +1367,18 @@ impl<H> Easy2<H> {
     /// let mut handle = Easy::new();
     /// handle.url("https://www.rust-lang.org/").unwrap();
     /// handle.http_headers(list).unwrap();
-    /// handle.perform().unwrap();
+    /// let mut event_loop = curl::EventLoop::new().unwrap();
+    /// event_loop.add(handle, |_, _| {}).unwrap();
+    /// event_loop.run().unwrap();
     /// ```
     pub fn http_headers(&mut self, list: List) -> Result<(), Error> {
         let ptr = list::raw(&list);
-        self.inner.header_list = Some(list);
-        self.setopt_ptr(curl_sys::CURLOPT_HTTPHEADER, ptr as *const _)
+        let result = self.setopt_ptr(curl_sys::CURLOPT_HTTPHEADER, ptr as *const _);
+        if result.is_ok() {
+            self.inner.header_list = Some(list);
+            self.inner.explicit_headers = true;
+        }
+        result
     }
 
     /// Add some headers to send to the HTTP proxy.
@@ -1924,11 +1710,21 @@ impl<H> Easy2<H> {
     pub fn timeout(&mut self, timeout: Duration) -> Result<(), Error> {
         let ms = timeout.as_millis();
         match c_long::try_from(ms) {
-            Ok(amt) => self.setopt_long(curl_sys::CURLOPT_TIMEOUT_MS, amt),
+            Ok(amt) => {
+                let r = self.setopt_long(curl_sys::CURLOPT_TIMEOUT_MS, amt);
+                if r.is_ok() {
+                    self.inner.explicit_timeout = true;
+                }
+                r
+            }
             Err(_) => {
                 let amt = c_long::try_from(ms / 1000)
                     .map_err(|_| Error::new(curl_sys::CURLE_BAD_FUNCTION_ARGUMENT))?;
-                self.setopt_long(curl_sys::CURLOPT_TIMEOUT, amt)
+                let r = self.setopt_long(curl_sys::CURLOPT_TIMEOUT, amt);
+                if r.is_ok() {
+                    self.inner.explicit_timeout = true;
+                }
+                r
             }
         }
     }
@@ -2089,7 +1885,9 @@ impl<H> Easy2<H> {
     /// let mut handle = Easy::new();
     /// handle.url("https://www.rust-lang.org/").unwrap();
     /// handle.resolve(list).unwrap();
-    /// handle.perform().unwrap();
+    /// let mut event_loop = curl::EventLoop::new().unwrap();
+    /// event_loop.add(handle, |_, _| {}).unwrap();
+    /// event_loop.run().unwrap();
     /// ```
     pub fn resolve(&mut self, list: List) -> Result<(), Error> {
         let ptr = list::raw(&list);
@@ -2109,6 +1907,22 @@ impl<H> Easy2<H> {
     /// `CURLOPT_CONNECT_ONLY`.
     pub fn connect_only(&mut self, enable: bool) -> Result<(), Error> {
         self.setopt_long(curl_sys::CURLOPT_CONNECT_ONLY, enable as c_long)
+    }
+
+    /// Configure pull-mode WebSocket behavior.
+    pub fn websocket_options(&mut self, raw_mode: bool, no_auto_pong: bool) -> Result<(), Error> {
+        let mut bits = 0;
+        if raw_mode {
+            bits |= curl_sys::CURLWS_RAW_MODE;
+        }
+        if no_auto_pong {
+            bits |= curl_sys::CURLWS_NOAUTOPONG;
+        }
+        self.setopt_long(curl_sys::CURLOPT_WS_OPTIONS, bits)
+    }
+    /// Enable libcurl's pull-mode WebSocket connection.
+    pub fn websocket_connect_only(&mut self) -> Result<(), Error> {
+        self.setopt_long(curl_sys::CURLOPT_CONNECT_ONLY, 2)
     }
 
     // /// Set interface to speak DNS over.
@@ -2280,6 +2094,7 @@ impl<H> Easy2<H> {
     /// By default this option is not set and corresponds to
     /// `CURLOPT_CAINFO_BLOB`.
     pub fn ssl_cainfo_blob(&mut self, blob: &[u8]) -> Result<(), Error> {
+        self.disable_native_ca();
         self.setopt_blob(curl_sys::CURLOPT_CAINFO_BLOB, blob)
     }
 
@@ -2452,7 +2267,12 @@ impl<H> Easy2<H> {
     /// By default this option is the system defaults, and corresponds to
     /// `CURLOPT_CAINFO`.
     pub fn cainfo<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Error> {
-        self.setopt_path(curl_sys::CURLOPT_CAINFO, path.as_ref())
+        self.disable_native_ca();
+        let r = self.setopt_path(curl_sys::CURLOPT_CAINFO, path.as_ref());
+        if r.is_ok() {
+            self.inner.explicit_cainfo = true;
+        }
+        r
     }
 
     /// Set the issuer SSL certificate filename
@@ -2465,7 +2285,7 @@ impl<H> Easy2<H> {
     /// specific branch of the tree.
     ///
     /// This option makes sense only when used in combination with the
-    /// [`Easy2::ssl_verify_peer`] option. Otherwise, the result of the check is
+    /// [`Easy::ssl_verify_peer`] option. Otherwise, the result of the check is
     /// not considered as failure.
     ///
     /// By default this option is not set and corresponds to
@@ -2484,7 +2304,7 @@ impl<H> Easy2<H> {
     /// specific branch of the tree.
     ///
     /// This option makes sense only when used in combination with the
-    /// [`Easy2::proxy_ssl_verify_peer`] option. Otherwise, the result of the
+    /// [`Easy::proxy_ssl_verify_peer`] option. Otherwise, the result of the
     /// check is not considered as failure.
     ///
     /// By default this option is not set and corresponds to
@@ -2526,6 +2346,7 @@ impl<H> Easy2<H> {
     ///
     /// By default this option is not set and corresponds to `CURLOPT_CAPATH`.
     pub fn capath<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Error> {
+        self.disable_native_ca();
         self.setopt_path(curl_sys::CURLOPT_CAPATH, path.as_ref())
     }
 
@@ -2541,7 +2362,7 @@ impl<H> Easy2<H> {
     /// the elements of the certificate chain if a CRL file is passed.
     ///
     /// This option makes sense only when used in combination with the
-    /// [`Easy2::ssl_verify_peer`] option.
+    /// [`Easy::ssl_verify_peer`] option.
     ///
     /// A specific error code (`is_ssl_crl_badfile`) is defined with the
     /// option. It is returned when the SSL exchange fails because the CRL file
@@ -2567,7 +2388,7 @@ impl<H> Easy2<H> {
     /// the elements of the certificate chain if a CRL file is passed.
     ///
     /// This option makes sense only when used in combination with the
-    /// [`Easy2::proxy_ssl_verify_peer`] option.
+    /// [`Easy::proxy_ssl_verify_peer`] option.
     ///
     /// By default this option is not set and corresponds to
     /// `CURLOPT_PROXY_CRLFILE`.
@@ -2700,7 +2521,13 @@ impl<H> Easy2<H> {
     ///
     /// This corresponds to the `CURLOPT_SSL_OPTIONS` option.
     pub fn ssl_options(&mut self, bits: &SslOpt) -> Result<(), Error> {
+        self.inner.ssl_options = bits.bits;
         self.setopt_long(curl_sys::CURLOPT_SSL_OPTIONS, bits.bits)
+    }
+
+    fn disable_native_ca(&mut self) {
+        self.inner.ssl_options &= !(curl_sys::CURLSSLOPT_NATIVE_CA as c_long);
+        let _ = self.setopt_long(curl_sys::CURLOPT_SSL_OPTIONS, self.inner.ssl_options);
     }
 
     /// Set SSL behavior options for proxies
@@ -2835,13 +2662,8 @@ impl<H> Easy2<H> {
     /// This corresponds to `CURLINFO_FILETIME` and may return an error if the
     /// option is not supported
     pub fn filetime(&self) -> Result<Option<i64>, Error> {
-        self.getopt_long(curl_sys::CURLINFO_FILETIME).map(|r| {
-            if r == -1 {
-                None
-            } else {
-                Some(r as i64)
-            }
-        })
+        self.getopt_long(curl_sys::CURLINFO_FILETIME)
+            .map(|r| if r == -1 { None } else { Some(r as i64) })
     }
 
     /// Get the number of downloaded bytes
@@ -3184,24 +3006,6 @@ impl<H> Easy2<H> {
     /// After options have been set, this will perform the transfer described by
     /// the options.
     ///
-    /// This performs the request in a synchronous fashion. This can be used
-    /// multiple times for one easy handle and libcurl will attempt to re-use
-    /// the same connection for all transfers.
-    ///
-    /// This method will preserve all options configured in this handle for the
-    /// next request, and if that is not desired then the options can be
-    /// manually reset or the `reset` method can be called.
-    ///
-    /// Note that this method takes `&self`, which is quite important! This
-    /// allows applications to close over the handle in various callbacks to
-    /// call methods like `unpause_write` and `unpause_read` while a transfer is
-    /// in progress.
-    pub fn perform(&self) -> Result<(), Error> {
-        let ret = unsafe { self.cvt(curl_sys::curl_easy_perform(self.inner.handle)) };
-        panic::propagate();
-        ret
-    }
-
     /// Some protocols have "connection upkeep" mechanisms. These mechanisms
     /// usually send some traffic on existing connections in order to keep them
     /// alive; this can prevent connections from being closed due to overzealous
@@ -3210,12 +3014,6 @@ impl<H> Easy2<H> {
     /// Currently the only protocol with a connection upkeep mechanism is
     /// HTTP/2: when the connection upkeep interval is exceeded and upkeep() is
     /// called, an HTTP/2 PING frame is sent on the connection.
-    #[cfg(feature = "upkeep_7_62_0")]
-    pub fn upkeep(&self) -> Result<(), Error> {
-        let ret = unsafe { self.cvt(curl_sys::curl_easy_upkeep(self.inner.handle)) };
-        panic::propagate();
-        return ret;
-    }
 
     /// Unpause reading on a connection.
     ///
@@ -3237,6 +3035,8 @@ impl<H> Easy2<H> {
             self.cvt(rc)
         }
     }
+
+    /// Unpause reading on a connection.
 
     /// Unpause writing on a connection.
     ///
@@ -3384,19 +3184,10 @@ impl<H> Easy2<H> {
         self.inner.handle
     }
 
-    #[cfg(unix)]
     fn setopt_path(&mut self, opt: curl_sys::CURLoption, val: &Path) -> Result<(), Error> {
         use std::os::unix::prelude::*;
         let s = CString::new(val.as_os_str().as_bytes())?;
         self.setopt_str(opt, &s)
-    }
-
-    #[cfg(windows)]
-    fn setopt_path(&mut self, opt: curl_sys::CURLoption, val: &Path) -> Result<(), Error> {
-        match val.to_str() {
-            Some(s) => self.setopt_str(opt, &CString::new(s)?),
-            None => Err(Error::new(curl_sys::CURLE_CONV_FAILED)),
-        }
     }
 
     fn setopt_long(&mut self, opt: curl_sys::CURLoption, val: c_long) -> Result<(), Error> {
@@ -3518,16 +3309,16 @@ impl<H> Easy2<H> {
     }
 }
 
-impl<H: fmt::Debug> fmt::Debug for Easy2<H> {
+impl fmt::Debug for Easy {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Easy")
             .field("handle", &self.inner.handle)
-            .field("handler", &self.inner.handler)
+            .field("callbacks", &"owned closures")
             .finish()
     }
 }
 
-impl<H> Drop for Easy2<H> {
+impl Drop for Easy {
     fn drop(&mut self) {
         unsafe {
             curl_sys::curl_easy_cleanup(self.inner.handle);
@@ -3535,7 +3326,7 @@ impl<H> Drop for Easy2<H> {
     }
 }
 
-extern "C" fn header_cb<H: Handler>(
+extern "C" fn header_cb(
     buffer: *mut c_char,
     size: size_t,
     nitems: size_t,
@@ -3543,25 +3334,16 @@ extern "C" fn header_cb<H: Handler>(
 ) -> size_t {
     let keep_going = panic::catch(|| unsafe {
         let data = slice::from_raw_parts(buffer as *const u8, size * nitems);
-        (*(userptr as *mut Inner<H>)).handler.header(data)
+        (*(userptr as *mut Inner)).callbacks.header(data)
     })
     .unwrap_or(false);
-    if keep_going {
-        size * nitems
-    } else {
-        !0
-    }
+    if keep_going { size * nitems } else { !0 }
 }
 
-extern "C" fn write_cb<H: Handler>(
-    ptr: *mut c_char,
-    size: size_t,
-    nmemb: size_t,
-    data: *mut c_void,
-) -> size_t {
+extern "C" fn write_cb(ptr: *mut c_char, size: size_t, nmemb: size_t, data: *mut c_void) -> size_t {
     panic::catch(|| unsafe {
         let input = slice::from_raw_parts(ptr as *const u8, size * nmemb);
-        match (*(data as *mut Inner<H>)).handler.write(input) {
+        match (*(data as *mut Inner)).callbacks.write(input) {
             Ok(s) => s,
             Err(WriteError::Pause) => curl_sys::CURL_WRITEFUNC_PAUSE,
         }
@@ -3569,15 +3351,10 @@ extern "C" fn write_cb<H: Handler>(
     .unwrap_or(!0)
 }
 
-extern "C" fn read_cb<H: Handler>(
-    ptr: *mut c_char,
-    size: size_t,
-    nmemb: size_t,
-    data: *mut c_void,
-) -> size_t {
+extern "C" fn read_cb(ptr: *mut c_char, size: size_t, nmemb: size_t, data: *mut c_void) -> size_t {
     panic::catch(|| unsafe {
         let input = slice::from_raw_parts_mut(ptr as *mut u8, size * nmemb);
-        match (*(data as *mut Inner<H>)).handler.read(input) {
+        match (*(data as *mut Inner)).callbacks.read(input) {
             Ok(s) => s,
             Err(ReadError::Pause) => curl_sys::CURL_READFUNC_PAUSE,
             Err(ReadError::Abort) => curl_sys::CURL_READFUNC_ABORT,
@@ -3586,23 +3363,19 @@ extern "C" fn read_cb<H: Handler>(
     .unwrap_or(!0)
 }
 
-extern "C" fn seek_cb<H: Handler>(
-    data: *mut c_void,
-    offset: curl_sys::curl_off_t,
-    origin: c_int,
-) -> c_int {
+extern "C" fn seek_cb(data: *mut c_void, offset: curl_sys::curl_off_t, origin: c_int) -> c_int {
     panic::catch(|| unsafe {
         let from = if origin == libc::SEEK_SET {
             SeekFrom::Start(offset as u64)
         } else {
             panic!("unknown origin from libcurl: {}", origin);
         };
-        (*(data as *mut Inner<H>)).handler.seek(from) as c_int
+        (*(data as *mut Inner)).callbacks.seek(from) as c_int
     })
     .unwrap_or(!0)
 }
 
-extern "C" fn progress_cb<H: Handler>(
+extern "C" fn progress_cb(
     data: *mut c_void,
     dltotal: c_double,
     dlnow: c_double,
@@ -3610,20 +3383,16 @@ extern "C" fn progress_cb<H: Handler>(
     ulnow: c_double,
 ) -> c_int {
     let keep_going = panic::catch(|| unsafe {
-        (*(data as *mut Inner<H>))
-            .handler
+        (*(data as *mut Inner))
+            .callbacks
             .progress(dltotal, dlnow, ultotal, ulnow)
     })
     .unwrap_or(false);
-    if keep_going {
-        0
-    } else {
-        1
-    }
+    if keep_going { 0 } else { 1 }
 }
 
 // TODO: expose `handle`? is that safe?
-extern "C" fn debug_cb<H: Handler>(
+extern "C" fn debug_cb(
     _handle: *mut curl_sys::CURL,
     kind: curl_sys::curl_infotype,
     data: *mut c_char,
@@ -3642,37 +3411,20 @@ extern "C" fn debug_cb<H: Handler>(
             curl_sys::CURLINFO_SSL_DATA_OUT => InfoType::SslDataOut,
             _ => return,
         };
-        (*(userptr as *mut Inner<H>)).handler.debug(kind, data)
+        (*(userptr as *mut Inner)).callbacks.debug(kind, data)
     });
     0
 }
 
-extern "C" fn ssl_ctx_cb<H: Handler>(
-    _handle: *mut curl_sys::CURL,
-    ssl_ctx: *mut c_void,
-    data: *mut c_void,
-) -> curl_sys::CURLcode {
-    let res = panic::catch(|| unsafe {
-        match (*(data as *mut Inner<H>)).handler.ssl_ctx(ssl_ctx) {
-            Ok(()) => curl_sys::CURLE_OK,
-            Err(e) => e.code(),
-        }
-    });
-    // Default to a generic SSL error in case of panic. This
-    // shouldn't really matter since the error should be
-    // propagated later on but better safe than sorry...
-    res.unwrap_or(curl_sys::CURLE_SSL_CONNECT_ERROR)
-}
-
 // TODO: expose `purpose` and `sockaddr` inside of `address`
-extern "C" fn opensocket_cb<H: Handler>(
+extern "C" fn opensocket_cb(
     data: *mut c_void,
     _purpose: curl_sys::curlsocktype,
     address: *mut curl_sys::curl_sockaddr,
 ) -> curl_sys::curl_socket_t {
     let res = panic::catch(|| unsafe {
-        (*(data as *mut Inner<H>))
-            .handler
+        (*(data as *mut Inner))
+            .callbacks
             .open_socket((*address).family, (*address).socktype, (*address).protocol)
             .unwrap_or(curl_sys::CURL_SOCKET_BAD)
     });
@@ -3751,9 +3503,6 @@ impl Auth {
     ///
     /// You need to build libcurl with a suitable GSS-API library or SSPI on
     /// Windows for this to work.
-    pub fn gssnegotiate(&mut self, on: bool) -> &mut Auth {
-        self.flag(curl_sys::CURLAUTH_GSSNEGOTIATE, on)
-    }
 
     /// HTTP NTLM authentication.
     ///
@@ -3763,9 +3512,6 @@ impl Auth {
     ///
     /// You need to build libcurl with either OpenSSL, GnuTLS or NSS support for
     /// this option to work, or build libcurl on Windows with SSPI support.
-    pub fn ntlm(&mut self, on: bool) -> &mut Auth {
-        self.flag(curl_sys::CURLAUTH_NTLM, on)
-    }
 
     /// NTLM delegating to winbind helper.
     ///
@@ -3786,9 +3532,6 @@ impl Auth {
     /// A proprietary protocol invented and used by Microsoft. It uses a
     /// challenge-response and hash concept similar to Digest, to prevent the
     /// password from being eavesdropped.
-    pub fn ntlm_wb(&mut self, on: bool) -> &mut Auth {
-        self.flag(curl_sys::CURLAUTH_NTLM_WB, on)
-    }
 
     /// HTTP AWS V4 signature authentication.
     ///
@@ -3796,18 +3539,12 @@ impl Auth {
     /// It will override the other auth types you might have set.
     ///
     /// Enabling this auth type is the same as using "aws:amz" as param in
-    /// [`Easy2::aws_sigv4`](struct.Easy2.html#method.aws_sigv4) method.
-    pub fn aws_sigv4(&mut self, on: bool) -> &mut Auth {
-        self.flag(curl_sys::CURLAUTH_AWS_SIGV4, on)
-    }
+    /// [`Easy::aws_sigv4`](struct.Easy.html#method.aws_sigv4) method.
 
     /// HTTP Auto authentication.
     ///
     /// This is a combination for CURLAUTH_BASIC | CURLAUTH_DIGEST |
     /// CURLAUTH_GSSNEGOTIATE | CURLAUTH_NTLM
-    pub fn auto(&mut self, on: bool) -> &mut Auth {
-        self.flag(curl_sys::CURLAUTH_ANY, on)
-    }
 
     fn flag(&mut self, bit: c_ulong, on: bool) -> &mut Auth {
         if on {
@@ -3934,65 +3671,127 @@ impl fmt::Debug for SslOpt {
     }
 }
 
-impl PostRedirections {
-    /// Create an empty PostRedirection setting with no flags set.
-    pub fn new() -> PostRedirections {
-        PostRedirections { bits: 0 }
-    }
-
-    /// Configure POST method behaviour on a 301 redirect. Setting the value
-    /// to true will preserve the method when following the redirect, else
-    /// the method is changed to GET.
-    pub fn redirect_301(&mut self, on: bool) -> &mut PostRedirections {
-        self.flag(curl_sys::CURL_REDIR_POST_301, on)
-    }
-
-    /// Configure POST method behaviour on a 302 redirect. Setting the value
-    /// to true will preserve the method when following the redirect, else
-    /// the method is changed to GET.
-    pub fn redirect_302(&mut self, on: bool) -> &mut PostRedirections {
-        self.flag(curl_sys::CURL_REDIR_POST_302, on)
-    }
-
-    /// Configure POST method behaviour on a 303 redirect. Setting the value
-    /// to true will preserve the method when following the redirect, else
-    /// the method is changed to GET.
-    pub fn redirect_303(&mut self, on: bool) -> &mut PostRedirections {
-        self.flag(curl_sys::CURL_REDIR_POST_303, on)
-    }
-
-    /// Configure POST method behaviour for all redirects. Setting the value
-    /// to true will preserve the method when following the redirect, else
-    /// the method is changed to GET.
-    pub fn redirect_all(&mut self, on: bool) -> &mut PostRedirections {
-        self.flag(curl_sys::CURL_REDIR_POST_ALL, on)
-    }
-
-    fn flag(&mut self, bit: c_ulong, on: bool) -> &mut PostRedirections {
-        if on {
-            self.bits |= bit;
-        } else {
-            self.bits &= !bit;
+#[derive(Default)]
+struct Callbacks {
+    write: Option<Box<dyn FnMut(&[u8]) -> Result<usize, WriteError> + 'static>>,
+    read: Option<Box<dyn FnMut(&mut [u8]) -> Result<usize, ReadError> + 'static>>,
+    seek: Option<Box<dyn FnMut(SeekFrom) -> SeekResult + 'static>>,
+    debug: Option<Box<dyn FnMut(InfoType, &[u8]) + 'static>>,
+    header: Option<Box<dyn FnMut(&[u8]) -> bool + 'static>>,
+    progress: Option<Box<dyn FnMut(f64, f64, f64, f64) -> bool + 'static>>,
+    open_socket: Option<Box<dyn FnMut(c_int, c_int, c_int) -> Option<curl_sys::curl_socket_t>>>,
+}
+impl Callbacks {
+    pub(super) fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
+        match self.write.as_mut() {
+            Some(f) => f(data),
+            None => Ok(data.len()),
         }
-        self
+    }
+    pub(super) fn read(&mut self, data: &mut [u8]) -> Result<usize, ReadError> {
+        match self.read.as_mut() {
+            Some(f) => f(data),
+            None => Ok(0),
+        }
+    }
+    pub(super) fn seek(&mut self, w: SeekFrom) -> SeekResult {
+        match self.seek.as_mut() {
+            Some(f) => f(w),
+            None => SeekResult::CantSeek,
+        }
+    }
+    pub(super) fn debug(&mut self, k: InfoType, d: &[u8]) {
+        match self.debug.as_mut() {
+            Some(f) => f(k, d),
+            None => debug(k, d),
+        }
+    }
+    pub(super) fn header(&mut self, d: &[u8]) -> bool {
+        match self.header.as_mut() {
+            Some(f) => f(d),
+            None => true,
+        }
+    }
+    pub(super) fn progress(&mut self, a: f64, b: f64, c: f64, d: f64) -> bool {
+        match self.progress.as_mut() {
+            Some(f) => f(a, b, c, d),
+            None => true,
+        }
+    }
+    fn open_socket(
+        &mut self,
+        family: c_int,
+        socktype: c_int,
+        protocol: c_int,
+    ) -> Option<curl_sys::curl_socket_t> {
+        match self.open_socket.as_mut() {
+            Some(f) => f(family, socktype, protocol),
+            None => open_socket(family, socktype, protocol),
+        }
     }
 }
 
-impl fmt::Debug for PostRedirections {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("PostRedirections")
-            .field(
-                "redirect_301",
-                &(self.bits & curl_sys::CURL_REDIR_POST_301 != 0),
-            )
-            .field(
-                "redirect_302",
-                &(self.bits & curl_sys::CURL_REDIR_POST_302 != 0),
-            )
-            .field(
-                "redirect_303",
-                &(self.bits & curl_sys::CURL_REDIR_POST_303 != 0),
-            )
-            .finish()
+impl Easy {
+    /// Sets the write callback, which runs on the owning thread.
+    pub fn write_function<F>(&mut self, f: F) -> Result<(), Error>
+    where
+        F: FnMut(&[u8]) -> Result<usize, WriteError> + 'static,
+    {
+        self.inner.callbacks.write = Some(Box::new(f));
+        Ok(())
+    }
+
+    /// Sets the read callback, which runs on the owning thread.
+    pub fn read_function<F>(&mut self, f: F) -> Result<(), Error>
+    where
+        F: FnMut(&mut [u8]) -> Result<usize, ReadError> + 'static,
+    {
+        self.inner.callbacks.read = Some(Box::new(f));
+        Ok(())
+    }
+
+    /// Sets the seek callback, which runs on the owning thread.
+    pub fn seek_function<F>(&mut self, f: F) -> Result<(), Error>
+    where
+        F: FnMut(SeekFrom) -> SeekResult + 'static,
+    {
+        self.inner.callbacks.seek = Some(Box::new(f));
+        Ok(())
+    }
+
+    /// Sets the progress callback, which runs on the owning thread.
+    pub fn progress_function<F>(&mut self, f: F) -> Result<(), Error>
+    where
+        F: FnMut(f64, f64, f64, f64) -> bool + 'static,
+    {
+        self.inner.callbacks.progress = Some(Box::new(f));
+        Ok(())
+    }
+
+    /// Sets the debug callback, which runs on the owning thread.
+    pub fn debug_function<F>(&mut self, f: F) -> Result<(), Error>
+    where
+        F: FnMut(InfoType, &[u8]) + 'static,
+    {
+        self.inner.callbacks.debug = Some(Box::new(f));
+        Ok(())
+    }
+
+    /// Sets the header callback, which runs on the owning thread.
+    pub fn header_function<F>(&mut self, f: F) -> Result<(), Error>
+    where
+        F: FnMut(&[u8]) -> bool + 'static,
+    {
+        self.inner.callbacks.header = Some(Box::new(f));
+        Ok(())
+    }
+
+    /// Overrides socket creation. A returned descriptor transfers ownership to curl.
+    pub fn open_socket_function<F>(&mut self, f: F) -> Result<(), Error>
+    where
+        F: FnMut(c_int, c_int, c_int) -> Option<curl_sys::curl_socket_t> + 'static,
+    {
+        self.inner.callbacks.open_socket = Some(Box::new(f));
+        Ok(())
     }
 }

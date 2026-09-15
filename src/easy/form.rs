@@ -1,21 +1,34 @@
 use std::ffi::CString;
 use std::fmt;
+use std::marker::PhantomData;
 use std::path::Path;
 use std::ptr;
 
-use crate::easy::{list, List};
 use crate::FormError;
+use crate::easy::{List, list};
 
 /// Multipart/formdata for an HTTP POST request.
 ///
 /// This structure is built up and then passed to the `Easy::httppost` method to
 /// be sent off with a request.
+///
+/// This value cannot move to another thread:
+/// ```compile_fail
+/// let value = curl::easy::Form::new();
+/// std::thread::spawn(move || drop(value));
+/// ```
+/// It cannot be shared across threads through `Arc`:
+/// ```compile_fail
+/// let value = std::sync::Arc::new(curl::easy::Form::new());
+/// std::thread::spawn(move || drop(value));
+/// ```
 pub struct Form {
     head: *mut curl_sys::curl_httppost,
     tail: *mut curl_sys::curl_httppost,
     headers: Vec<List>,
     buffers: Vec<Vec<u8>>,
     strings: Vec<CString>,
+    _marker: PhantomData<*mut ()>,
 }
 
 /// One part in a multipart upload, added to a `Form`.
@@ -39,6 +52,7 @@ impl Form {
             headers: Vec::new(),
             buffers: Vec::new(),
             strings: Vec::new(),
+            _marker: PhantomData,
         }
     }
 
@@ -332,23 +346,9 @@ impl<'form, 'data> Part<'form, 'data> {
         }
     }
 
-    #[cfg(unix)]
     fn path2cstr(&mut self, p: &Path) -> Option<CString> {
         use std::os::unix::prelude::*;
         self.bytes2cstr(p.as_os_str().as_bytes())
-    }
-
-    #[cfg(windows)]
-    fn path2cstr(&mut self, p: &Path) -> Option<CString> {
-        match p.to_str() {
-            Some(bytes) => self.bytes2cstr(bytes.as_bytes()),
-            None if self.error.is_none() => {
-                // TODO: better error code
-                self.error = Some(FormError::new(curl_sys::CURL_FORMADD_INCOMPLETE));
-                None
-            }
-            None => None,
-        }
     }
 
     fn bytes2cstr(&mut self, bytes: &[u8]) -> Option<CString> {

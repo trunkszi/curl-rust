@@ -211,7 +211,7 @@ fn main() {
         if version < (7, 54) {
             match s {
                 "CURL_SSLVERSION_TLSv1_3" | "CURLOPT_PROXY_SSLCERT" | "CURLOPT_PROXY_SSLKEY" => {
-                    return true
+                    return true;
                 }
                 _ => {}
             }
@@ -281,9 +281,20 @@ fn main() {
         }
     });
 
-    if cfg!(target_env = "msvc") {
-        cfg.skip_fn_ptrcheck(|s| s.starts_with("curl_"));
-    }
+    println!("cargo:rerun-if-changed=../curl-sys/lib.rs");
+    let out_dir = std::path::PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let preprocessed_path = out_dir.join("curl_sys_lib.rs");
+    let content =
+        std::fs::read_to_string("../curl-sys/lib.rs").expect("failed to read curl-sys/lib.rs");
+    // ctest2 uses garando_syntax which does not support Rust 2024's `unsafe extern` blocks.
+    let content = content.replace("unsafe extern \"C\"", "extern \"C\"");
+    std::fs::write(&preprocessed_path, content)
+        .expect("failed to write preprocessed curl-sys/lib.rs");
 
-    cfg.generate("../curl-sys/lib.rs", "all.rs");
+    cfg.generate(&preprocessed_path, "all.rs");
+
+    let all_rs_path = out_dir.join("all.rs");
+    let all_content = std::fs::read_to_string(&all_rs_path).expect("failed to read all.rs");
+    let all_content = all_content.replace("extern \"C\" {", "unsafe extern \"C\" {");
+    std::fs::write(&all_rs_path, all_content).expect("failed to write all.rs");
 }

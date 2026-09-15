@@ -1,12 +1,25 @@
 use std::ffi::{CStr, CString};
 use std::fmt;
+use std::marker::PhantomData;
 use std::ptr;
 
 use crate::Error;
 
 /// A linked list of a strings
+///
+/// This value cannot move to another thread:
+/// ```compile_fail
+/// let value = curl::easy::List::new();
+/// std::thread::spawn(move || drop(value));
+/// ```
+/// It cannot be shared across threads through `Arc`:
+/// ```compile_fail
+/// let value = std::sync::Arc::new(curl::easy::List::new());
+/// std::thread::spawn(move || drop(value));
+/// ```
 pub struct List {
     raw: *mut curl_sys::curl_slist,
+    _marker: PhantomData<*mut ()>,
 }
 
 /// An iterator over `List`
@@ -21,16 +34,18 @@ pub fn raw(list: &List) -> *mut curl_sys::curl_slist {
 }
 
 pub unsafe fn from_raw(raw: *mut curl_sys::curl_slist) -> List {
-    List { raw }
+    List {
+        raw,
+        _marker: PhantomData,
+    }
 }
-
-unsafe impl Send for List {}
 
 impl List {
     /// Creates a new empty list of strings.
     pub fn new() -> List {
         List {
             raw: ptr::null_mut(),
+            _marker: PhantomData,
         }
     }
 
