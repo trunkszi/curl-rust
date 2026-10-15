@@ -404,17 +404,6 @@ fn misc() {
 }
 
 #[test]
-fn dns_servers() {
-    let mut h = handle();
-    // Tests are not using a libcurl with c-ares, so this
-    // always fails. Test anyway to make sure it returns
-    // an error instead of panicing.
-    assert!(h.dns_servers("").is_err());
-    assert!(h.dns_servers("nonsense").is_err());
-    assert!(h.dns_servers("8.8.8.8,8.8.4.4").is_err());
-}
-
-#[test]
 fn userpass() {
     let s = Server::new();
     s.receive(
@@ -971,10 +960,30 @@ use curl::websocket::{
     WebSocketHandler as WsHandler,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OwnedWsMessage {
+    Text(String),
+    Binary(Vec<u8>),
+    Ping(Vec<u8>),
+    Pong(Vec<u8>),
+}
+
+impl From<WsMessage<'_>> for OwnedWsMessage {
+    fn from(m: WsMessage<'_>) -> Self {
+        match m {
+            WsMessage::Text(s) => Self::Text(s.to_owned()),
+            WsMessage::Binary(b) => Self::Binary(b.to_vec()),
+            WsMessage::Ping(b) => Self::Ping(b.to_vec()),
+            WsMessage::Pong(b) => Self::Pong(b.to_vec()),
+            WsMessage::Close { .. } => unreachable!("peer Close never fires on_message"),
+        }
+    }
+}
+
 #[derive(Default)]
 struct WsObservations {
     opened: usize,
-    messages: Vec<WsMessage>,
+    messages: Vec<OwnedWsMessage>,
     closes: Vec<(WsCode, String)>,
     errors: Vec<curl::event_loop::Error>,
 }
@@ -983,11 +992,11 @@ impl WsHandler for ObserveWs {
     fn on_open(&mut self, _: &WsClient) {
         self.0.borrow_mut().opened += 1;
     }
-    fn on_message(&mut self, _: &WsClient, message: WsMessage) {
-        self.0.borrow_mut().messages.push(message);
+    fn on_message(&mut self, _: &WsClient, message: WsMessage<'_>) {
+        self.0.borrow_mut().messages.push(message.into());
     }
-    fn on_close(&mut self, _: &WsClient, code: WsCode, reason: String) {
-        self.0.borrow_mut().closes.push((code, reason));
+    fn on_close(&mut self, _: &WsClient, code: WsCode, reason: &str) {
+        self.0.borrow_mut().closes.push((code, reason.to_owned()));
     }
     fn on_error(&mut self, _: &WsClient, error: curl::event_loop::Error) {
         self.0.borrow_mut().errors.push(error);
@@ -1017,11 +1026,11 @@ fn websocket_handshake_delivers_connection_and_can_send() {
     easy.url(&service.ws_url()).unwrap();
     let mut lp = curl::EventLoop::new().unwrap();
     let (ws, observed) = observed_ws(&lp, easy, WsOptions::default());
-    ws.send(WsMessage::Text("hello".into())).unwrap();
+    ws.send_text("hello").unwrap();
     drive_ws_until(&mut lp, || !observed.borrow().messages.is_empty());
     let events = observed.borrow();
     assert_eq!(events.opened, 1);
-    assert_eq!(events.messages, vec![WsMessage::Text("hello".into())]);
+    assert_eq!(events.messages, vec![OwnedWsMessage::Text("hello".into())]);
     assert!(events.closes.is_empty());
 }
 
@@ -1050,20 +1059,18 @@ fn websocket_message_size_limit_is_enforced() {
     let mut lp = curl::EventLoop::new().unwrap();
     let (bad_ws, rejected) = observed_ws(&lp, bad_easy, WsOptions::default().max_message_size(2));
     let (good_ws, healthy) = observed_ws(&lp, good_easy, WsOptions::default());
-    bad_ws.send(WsMessage::Text("oversized".into())).unwrap();
+    bad_ws.send_text("oversized").unwrap();
     drive_ws_until(&mut lp, || !rejected.borrow().closes.is_empty());
     assert!(matches!(
         rejected.borrow().errors.as_slice(),
         [curl::event_loop::Error::MessageTooLarge]
     ));
     assert_eq!(rejected.borrow().closes[0].0, WsCode(1009));
-    good_ws
-        .send(WsMessage::Text("healthy after rejection".into()))
-        .unwrap();
+    good_ws.send_text("healthy after rejection").unwrap();
     drive_ws_until(&mut lp, || !healthy.borrow().messages.is_empty());
     assert_eq!(
         healthy.borrow().messages,
-        vec![WsMessage::Text("healthy after rejection".into())]
+        vec![OwnedWsMessage::Text("healthy after rejection".into())]
     );
 }
 
@@ -1075,11 +1082,12 @@ fn websocket_wss_echo_with_custom_ca() {
     easy.cainfo("tests/support/ca.pem").unwrap();
     let mut lp = curl::EventLoop::new().unwrap();
     let (ws, observed) = observed_ws(&lp, easy, WsOptions::default());
-    let payload = WsMessage::Text("hello".into());
-    let expected = payload.clone();
-    ws.send(payload).unwrap();
+    ws.send_text("hello").unwrap();
     drive_ws_until(&mut lp, || !observed.borrow().messages.is_empty());
-    assert_eq!(observed.borrow().messages, vec![expected]);
+    assert_eq!(
+        observed.borrow().messages,
+        vec![OwnedWsMessage::Text("hello".into())]
+    );
 }
 
 #[test]
@@ -1089,11 +1097,12 @@ fn websocket_fragmented_message_is_reassembled() {
     easy.url(&service.ws_url()).unwrap();
     let mut lp = curl::EventLoop::new().unwrap();
     let (ws, observed) = observed_ws(&lp, easy, WsOptions::default());
-    let payload = WsMessage::Text("fragmented".into());
-    let expected = payload.clone();
-    ws.send(payload).unwrap();
+    ws.send_text("fragmented").unwrap();
     drive_ws_until(&mut lp, || !observed.borrow().messages.is_empty());
-    assert_eq!(observed.borrow().messages, vec![expected]);
+    assert_eq!(
+        observed.borrow().messages,
+        vec![OwnedWsMessage::Text("fragmented".into())]
+    );
 }
 
 #[test]
@@ -1103,15 +1112,12 @@ fn websocket_binary_roundtrip() {
     easy.url(&service.ws_url()).unwrap();
     let mut lp = curl::EventLoop::new().unwrap();
     let (ws, observed) = observed_ws(&lp, easy, WsOptions::default());
-    let payload = WsMessage::Binary(
-        (0..1024 * 1024)
-            .map(|i| (i as u8).wrapping_mul(31))
-            .collect(),
-    );
-    let expected = payload.clone();
-    ws.send(payload).unwrap();
+    let data: Vec<u8> = (0..1024 * 1024)
+        .map(|i| (i as u8).wrapping_mul(31))
+        .collect();
+    ws.send_binary(&data).unwrap();
     drive_ws_until(&mut lp, || !observed.borrow().messages.is_empty());
-    assert_eq!(observed.borrow().messages, vec![expected]);
+    assert_eq!(observed.borrow().messages, vec![OwnedWsMessage::Binary(data)]);
 }
 
 #[test]
@@ -1121,11 +1127,12 @@ fn websocket_ping_pong_visible() {
     easy.url(&service.ws_url()).unwrap();
     let mut lp = curl::EventLoop::new().unwrap();
     let (ws, observed) = observed_ws(&lp, easy, WsOptions::default());
-    let payload = WsMessage::Ping(b"x".to_vec());
-    let expected = WsMessage::Pong(b"x".to_vec());
-    ws.send(payload).unwrap();
+    ws.send(WsMessage::Ping(b"x")).unwrap();
     drive_ws_until(&mut lp, || !observed.borrow().messages.is_empty());
-    assert_eq!(observed.borrow().messages, vec![expected]);
+    assert_eq!(
+        observed.borrow().messages,
+        vec![OwnedWsMessage::Pong(b"x".to_vec())]
+    );
 }
 
 #[test]
@@ -1198,13 +1205,13 @@ fn http_and_websocket_share_event_loop() {
         })
         .unwrap();
     let (ws, observed) = observed_ws(&lp, easy, WsOptions::default());
-    ws.send(WsMessage::Text("hello".into())).unwrap();
+    ws.send_text("hello").unwrap();
     drive_ws_until(&mut lp, || {
         done.get() && !observed.borrow().messages.is_empty()
     });
     assert_eq!(
         observed.borrow().messages,
-        vec![WsMessage::Text("hello".into())]
+        vec![OwnedWsMessage::Text("hello".into())]
     );
 }
 #[test]
@@ -1215,7 +1222,7 @@ fn websocket_send_buffer_full() {
     let lp = curl::EventLoop::new().unwrap();
     let (ws, _) = observed_ws(&lp, easy, WsOptions::default().max_send_buffer(64 * 1024));
     assert!(matches!(
-        ws.send(WsMessage::Binary(vec![7; 128 * 1024])),
+        ws.send_binary(&vec![7; 128 * 1024]),
         Err(curl::event_loop::Error::SendBufferFull)
     ));
 }
@@ -1229,9 +1236,9 @@ fn websocket_connect_returns_live_handle_and_queues_before_open() {
             assert_eq!(ws.state(), WebSocketState::Open);
             self.0.borrow_mut().push("open".into());
         }
-        fn on_message(&mut self, _: &WebSocketClient, message: Message) {
+        fn on_message(&mut self, _: &WebSocketClient, message: Message<'_>) {
             if let Message::Text(text) = message {
-                self.0.borrow_mut().push(text);
+                self.0.borrow_mut().push(text.to_owned());
             }
         }
     }
@@ -1243,8 +1250,7 @@ fn websocket_connect_returns_live_handle_and_queues_before_open() {
     let ws =
         WebSocketClient::connect(&lp, easy, Options::default(), Handler(events.clone())).unwrap();
     assert_eq!(ws.state(), WebSocketState::Connecting);
-    ws.send(Message::Text("queued before handshake".into()))
-        .unwrap();
+    ws.send_text("queued before handshake").unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while events.borrow().len() < 2 && std::time::Instant::now() < deadline {
         lp.run_once(Duration::from_millis(10)).unwrap();
@@ -1309,7 +1315,7 @@ fn websocket_handle_reports_loop_gone_after_event_loop_drop() {
     .unwrap();
     drop(lp);
     assert!(matches!(
-        ws.send(curl::websocket::Message::Ping(vec![])),
+        ws.send(curl::websocket::Message::Ping(&[])),
         Err(curl::event_loop::Error::LoopGone)
     ));
 }
@@ -1331,7 +1337,7 @@ fn websocket_ping_interval_receives_pongs() {
             .borrow()
             .messages
             .iter()
-            .filter(|m| matches!(m, WsMessage::Pong(_)))
+            .filter(|m| matches!(m, OwnedWsMessage::Pong(_)))
             .count()
             < 2
     {
@@ -1342,7 +1348,7 @@ fn websocket_ping_interval_receives_pongs() {
             .borrow()
             .messages
             .iter()
-            .filter(|m| matches!(m, WsMessage::Pong(_)))
+            .filter(|m| matches!(m, OwnedWsMessage::Pong(_)))
             .count()
             >= 2
     );
@@ -1356,8 +1362,10 @@ fn websocket_peer_active_close_is_acknowledged() {
     let mut lp = curl::EventLoop::new().unwrap();
     let (_ws, observed) = observed_ws(&lp, easy, WsOptions::default());
     drive_ws_until(&mut lp, || !observed.borrow().closes.is_empty());
+    assert_eq!(observed.borrow().messages.len(), 0);
     assert_eq!(
         observed.borrow().closes[0],
         (WsCode(1001), "going away".into())
     );
 }
+

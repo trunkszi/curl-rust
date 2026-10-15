@@ -336,79 +336,6 @@ impl fmt::Debug for Error {
 
 impl error::Error for Error {}
 
-/// An error returned from "share" operations.
-///
-/// This structure wraps a `CURLSHcode`.
-#[derive(Clone, PartialEq)]
-pub struct ShareError {
-    code: curl_sys::CURLSHcode,
-}
-
-impl ShareError {
-    /// Creates a new error from the underlying code returned by libcurl.
-    pub fn new(code: curl_sys::CURLSHcode) -> ShareError {
-        ShareError { code }
-    }
-
-    /// Returns whether this error corresponds to CURLSHE_BAD_OPTION.
-    pub fn is_bad_option(&self) -> bool {
-        self.code == curl_sys::CURLSHE_BAD_OPTION
-    }
-
-    /// Returns whether this error corresponds to CURLSHE_IN_USE.
-    pub fn is_in_use(&self) -> bool {
-        self.code == curl_sys::CURLSHE_IN_USE
-    }
-
-    /// Returns whether this error corresponds to CURLSHE_INVALID.
-    pub fn is_invalid(&self) -> bool {
-        self.code == curl_sys::CURLSHE_INVALID
-    }
-
-    /// Returns whether this error corresponds to CURLSHE_NOMEM.
-    pub fn is_nomem(&self) -> bool {
-        self.code == curl_sys::CURLSHE_NOMEM
-    }
-
-    // /// Returns whether this error corresponds to CURLSHE_NOT_BUILT_IN.
-    // pub fn is_not_built_in(&self) -> bool {
-    //     self.code == curl_sys::CURLSHE_NOT_BUILT_IN
-    // }
-
-    /// Returns the value of the underlying error corresponding to libcurl.
-    pub fn code(&self) -> curl_sys::CURLSHcode {
-        self.code
-    }
-
-    /// Returns curl's human-readable version of this error.
-    pub fn description(&self) -> &str {
-        unsafe {
-            let s = curl_sys::curl_share_strerror(self.code);
-            assert!(!s.is_null());
-            str::from_utf8(CStr::from_ptr(s).to_bytes()).unwrap()
-        }
-    }
-}
-
-impl fmt::Display for ShareError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        self.description().fmt(f)
-    }
-}
-
-impl fmt::Debug for ShareError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "ShareError {{ description: {:?}, code: {} }}",
-            self.description(),
-            self.code
-        )
-    }
-}
-
-impl error::Error for ShareError {}
-
 /// An error from "multi" operations.
 ///
 /// This structure wraps a `CURLMcode`.
@@ -594,12 +521,6 @@ impl From<ffi::NulError> for Error {
 
 impl From<Error> for io::Error {
     fn from(e: Error) -> io::Error {
-        io::Error::new(io::ErrorKind::Other, e)
-    }
-}
-
-impl From<ShareError> for io::Error {
-    fn from(e: ShareError) -> io::Error {
         io::Error::new(io::ErrorKind::Other, e)
     }
 }

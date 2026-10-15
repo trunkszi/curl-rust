@@ -96,7 +96,7 @@ fn multi_clients_share_one_loop() {
         expected: String,
     }
     impl WebSocketHandler for Echo {
-        fn on_message(&mut self, _: &WebSocketClient, message: Message) {
+        fn on_message(&mut self, _: &WebSocketClient, message: Message<'_>) {
             if let Message::Text(text) = message {
                 assert_eq!(text, self.expected);
                 *self.count.borrow_mut() += 1;
@@ -150,7 +150,7 @@ fn multi_clients_share_one_loop() {
             },
         )
         .unwrap();
-        ws.send(Message::Text(payload)).unwrap();
+        ws.send_text(&payload).unwrap();
         sockets.push(ws);
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(3);

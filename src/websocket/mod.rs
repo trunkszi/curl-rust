@@ -1,30 +1,27 @@
 //! Pull-mode WebSocketClient message types.
 /// Public interface for this event-loop operation.
 pub(crate) mod connection;
-/// Public interface for this event-loop operation.
-pub(crate) mod runtime;
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::marker::PhantomData;
 use std::rc::{Rc, Weak};
-use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[doc = "WebSocket public interface."]
-pub enum Message {
+pub enum Message<'a> {
     #[doc = "WebSocket message variant."]
-    Text(String),
+    Text(&'a str),
     #[doc = "WebSocket message variant."]
-    Binary(Vec<u8>),
+    Binary(&'a [u8]),
     #[doc = "WebSocket message variant."]
-    Ping(Vec<u8>),
+    Ping(&'a [u8]),
     #[doc = "WebSocket message variant."]
-    Pong(Vec<u8>),
+    Pong(&'a [u8]),
     #[doc = "WebSocket message variant."]
     Close {
         /// Close status code.
         code: CloseCode,
         /// Human-readable close reason.
-        reason: String,
+        reason: &'a str,
     },
 }
 
@@ -34,9 +31,9 @@ pub trait WebSocketHandler {
     /// Handles this WebSocket operation.
     fn on_open(&mut self, _ws: &WebSocketClient) {}
     /// Handles this WebSocket operation.
-    fn on_message(&mut self, _ws: &WebSocketClient, _message: Message) {}
+    fn on_message(&mut self, _ws: &WebSocketClient, _message: Message<'_>) {}
     /// Handles this WebSocket operation.
-    fn on_close(&mut self, _ws: &WebSocketClient, _code: CloseCode, _reason: String) {}
+    fn on_close(&mut self, _ws: &WebSocketClient, _code: CloseCode, _reason: &str) {}
     /// Handles this WebSocket operation.
     fn on_error(&mut self, _ws: &WebSocketClient, _error: crate::event_loop::Error) {}
 }
@@ -46,7 +43,8 @@ pub trait WebSocketHandler {
 pub struct Options {
     /// Public interface for this event-loop operation.
     pub max_message_size: usize,
-    /// Public interface for this event-loop operation.
+    /// Maximum queued payload bytes and maximum payload size accepted by `send`.
+    /// Oversized messages are rejected before any bytes are transmitted.
     pub max_send_buffer: usize,
     /// Public interface for this event-loop operation.
     pub close_timeout: std::time::Duration,
@@ -100,56 +98,60 @@ impl Options {
 #[doc = "WebSocket public interface."]
 pub struct CloseCode(pub u16);
 impl CloseCode {
-    /// Public interface for this event-loop operation.
+    /// Normal closure (`1000`).
     pub const NORMAL: Self = Self(1000);
-    /// Public interface for this event-loop operation.
+    /// Endpoint is going away (`1001`).
     pub const GOING_AWAY: Self = Self(1001);
-    /// Public interface for this event-loop operation.
+    /// Protocol error (`1002`).
     pub const PROTOCOL_ERROR: Self = Self(1002);
-    /// Public interface for this event-loop operation.
+    /// Unsupported data (`1003`).
     pub const UNSUPPORTED_DATA: Self = Self(1003);
+    /// No status code was present (`1005`).
+    pub const NO_STATUS_RECEIVED: Self = Self(1005);
+    /// Abnormal closure without Close frame (`1006`).
+    pub const ABNORMAL_CLOSURE: Self = Self(1006);
+    /// Invalid frame payload data such as non-UTF-8 text (`1007`).
+    pub const INVALID_PAYLOAD: Self = Self(1007);
+    /// Message is too big to process (`1009`).
+    pub const MESSAGE_TOO_BIG: Self = Self(1009);
 }
 
-#[derive(Clone)]
 #[doc = "WebSocket public interface."]
 pub struct WebSocketClient {
     _marker: PhantomData<*mut ()>,
-    /// Public interface for this event-loop operation.
-    pub(crate) shared: Rc<RefCell<WebSocketShared>>,
-    loop_: Weak<crate::event_loop::LoopInner>,
-    guard: Rc<()>,
+    pub(crate) loop_: Weak<crate::event_loop::LoopInner>,
+    pub(crate) token: crate::event_loop::Token,
+    pub(crate) client_count: Rc<Cell<usize>>,
+    pub(crate) is_callback_ref: bool,
 }
 
-impl Drop for WebSocketClient {
-    fn drop(&mut self) {
-        if Rc::strong_count(&self.guard) != 1 {
-            return;
-        }
-        let mut state = self.shared.borrow_mut();
-        if state.state == WebSocketState::Open {
-            let _ = state.protocol.close(CloseCode::NORMAL, "", Instant::now());
-            state.state = WebSocketState::Closing;
+impl Clone for WebSocketClient {
+    fn clone(&self) -> Self {
+        self.client_count.set(self.client_count.get() + 1);
+        Self {
+            _marker: PhantomData,
+            loop_: self.loop_.clone(),
+            token: self.token,
+            client_count: self.client_count.clone(),
+            is_callback_ref: false,
         }
     }
 }
 
-/// Public interface for this event-loop operation.
-pub(crate) struct WebSocketShared {
-    /// Public interface for this event-loop operation.
-    pub(crate) protocol: connection::Connection,
-    /// Public interface for this event-loop operation.
-    pub(crate) curl_socket: Option<i32>,
-    /// Public interface for this event-loop operation.
-    pub message_cb: Option<Box<dyn FnMut(Message)>>,
-    /// Public interface for this event-loop operation.
-    pub close_cb: Option<Box<dyn FnMut(CloseCode, String)>>,
-    /// Public interface for this event-loop operation.
-    pub error_cb: Option<Box<dyn FnMut(crate::event_loop::Error)>>,
-    /// Public interface for this event-loop operation.
-    pub state: WebSocketState,
-    handler: Option<Box<dyn WebSocketHandler>>,
-    loop_: Weak<crate::event_loop::LoopInner>,
-    guard: Weak<()>,
+impl Drop for WebSocketClient {
+    fn drop(&mut self) {
+        if self.is_callback_ref {
+            return;
+        }
+        let prev = self.client_count.get();
+        let next = prev.saturating_sub(1);
+        self.client_count.set(next);
+        if next == 0 {
+            if let Some(loop_) = self.loop_.upgrade() {
+                loop_.on_ws_clients_zero(self.token);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -167,13 +169,14 @@ pub enum WebSocketState {
 
 impl std::fmt::Debug for WebSocketClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WebSocketClient").finish()
+        f.debug_struct("WebSocketClient")
+            .field("token", &self.token)
+            .finish()
     }
 }
 
 impl WebSocketClient {
-    /// Starts a WebSocket connection on an event loop.
-    /// Starts a connection and returns a client handle immediately.
+    /// Starts a WebSocket connection on an event loop and returns a client handle immediately.
     pub fn connect<H: WebSocketHandler + 'static>(
         loop_: &crate::event_loop::EventLoop,
         easy: crate::easy::Easy,
@@ -187,159 +190,79 @@ impl WebSocketClient {
                 error: error.into(),
             });
         }
-        let shared = Rc::new(RefCell::new(WebSocketShared::new(options)));
-        let client = Self::new(shared.clone(), Rc::downgrade(&loop_.inner), Rc::new(()));
-        {
-            let mut state = shared.borrow_mut();
-            state.handler = Some(Box::new(handler));
-            state.loop_ = client.loop_.clone();
-            state.guard = Rc::downgrade(&client.guard);
-        }
-        loop_.add_driver(
+        let client_count = Rc::new(Cell::new(1usize));
+        let token = loop_.inner.enqueue_websocket(
             easy,
-            Box::new(move |result| match result {
-                Ok(fd) => {
-                    {
-                        let mut state = shared.borrow_mut();
-                        state.state = WebSocketState::Open;
-                        state.curl_socket = Some(fd);
-                    }
-                    dispatch(&shared, |handler, ws| handler.on_open(ws));
-                    Some(Box::new(runtime::RuntimeDriver {
-                        shared,
-                        ending: None,
-                    }))
-                }
-                Err(error) => {
-                    shared.borrow_mut().state = WebSocketState::Closed;
-                    dispatch(&shared, |handler, ws| handler.on_error(ws, error));
-                    dispatch(&shared, |handler, ws| {
-                        handler.on_close(ws, CloseCode(1006), "connection failed".into())
-                    });
-                    None
-                }
-            }),
+            options,
+            Box::new(handler),
+            client_count.clone(),
         )?;
-        Ok(client)
+        Ok(Self {
+            _marker: PhantomData,
+            loop_: Rc::downgrade(&loop_.inner),
+            token,
+            client_count,
+            is_callback_ref: false,
+        })
     }
 
-    /// Public interface for this event-loop operation.
-    pub(crate) fn new(
-        shared: Rc<RefCell<WebSocketShared>>,
+    pub(crate) fn callback_ref(
         loop_: Weak<crate::event_loop::LoopInner>,
-        guard: Rc<()>,
+        token: crate::event_loop::Token,
+        client_count: Rc<Cell<usize>>,
     ) -> Self {
         Self {
-            shared,
-            loop_,
-            guard,
             _marker: PhantomData,
+            loop_,
+            token,
+            client_count,
+            is_callback_ref: true,
         }
     }
 
-    /// Public interface for this event-loop operation.
-    pub fn on_message<F>(&mut self, f: F) -> &mut Self
-    where
-        F: FnMut(Message) + 'static,
-    {
-        self.shared.borrow_mut().message_cb = Some(Box::new(f));
-        self
-    }
-
-    /// Public interface for this event-loop operation.
-    pub fn on_error<F>(&mut self, f: F) -> &mut Self
-    where
-        F: FnMut(crate::event_loop::Error) + 'static,
-    {
-        self.shared.borrow_mut().error_cb = Some(Box::new(f));
-        self
-    }
-
-    /// Public interface for this event-loop operation.
-    pub fn on_close<F>(&mut self, f: F) -> &mut Self
-    where
-        F: FnMut(CloseCode, String) + 'static,
-    {
-        self.shared.borrow_mut().close_cb = Some(Box::new(f));
-        self
-    }
-
-    /// Public interface for this event-loop operation.
-    pub fn send(&self, message: Message) -> Result<(), crate::event_loop::Error> {
-        if self.loop_.upgrade().is_none() {
-            return Err(crate::event_loop::Error::LoopGone);
+    /// Sends a WebSocket message, writing directly to the socket when the connection is open and unbuffered.
+    pub fn send(&self, message: Message<'_>) -> Result<(), crate::event_loop::Error> {
+        if let Message::Close { code, reason } = message {
+            return self.close(code, reason);
         }
-        self.shared.borrow_mut().protocol.enqueue(message)
+        let loop_ = self
+            .loop_
+            .upgrade()
+            .ok_or(crate::event_loop::Error::LoopGone)?;
+        loop_.ws_send(self.token, message)
     }
 
-    /// Public interface for this event-loop operation.
-    pub fn close(
-        &self,
-        code: CloseCode,
-        reason: impl Into<String>,
-    ) -> Result<(), crate::event_loop::Error> {
-        let reason = reason.into();
-        if self.loop_.upgrade().is_none() {
-            return Err(crate::event_loop::Error::LoopGone);
-        }
-        self.shared
-            .borrow_mut()
-            .protocol
-            .close(code, &reason, Instant::now())?;
-        self.shared.borrow_mut().state = WebSocketState::Closing;
-        Ok(())
+    /// Sends a UTF-8 text message without allocating an intermediate `String`.
+    pub fn send_text(&self, text: &str) -> Result<(), crate::event_loop::Error> {
+        self.send(Message::Text(text))
+    }
+
+    /// Sends a binary message without allocating an intermediate `Vec<u8>`.
+    pub fn send_binary(&self, data: &[u8]) -> Result<(), crate::event_loop::Error> {
+        self.send(Message::Binary(data))
+    }
+
+    /// Initiates a graceful WebSocket close handshake.
+    pub fn close(&self, code: CloseCode, reason: &str) -> Result<(), crate::event_loop::Error> {
+        let loop_ = self
+            .loop_
+            .upgrade()
+            .ok_or(crate::event_loop::Error::LoopGone)?;
+        loop_.ws_close(self.token, code, reason)
     }
 
     /// Returns the current protocol state.
     pub fn state(&self) -> WebSocketState {
-        self.shared.borrow().state
+        self.loop_
+            .upgrade()
+            .map_or(WebSocketState::Closed, |loop_| loop_.ws_state(self.token))
     }
 
     /// Returns the underlying socket when the handshake is complete.
     pub fn raw_fd(&self) -> Option<i32> {
-        self.shared.borrow().curl_socket
+        self.loop_
+            .upgrade()
+            .and_then(|loop_| loop_.ws_raw_fd(self.token))
     }
 }
 
-impl WebSocketShared {
-    /// Public interface for this event-loop operation.
-    pub(crate) fn new(options: Options) -> Self {
-        let protocol = connection::Connection::new(options.clone(), Instant::now());
-        Self {
-            protocol,
-            curl_socket: None,
-            state: WebSocketState::Connecting,
-            message_cb: None,
-            close_cb: None,
-            error_cb: None,
-            handler: None,
-            loop_: Weak::new(),
-            guard: Weak::new(),
-        }
-    }
-}
-
-fn dispatch(
-    shared: &Rc<RefCell<WebSocketShared>>,
-    callback: impl FnOnce(&mut dyn WebSocketHandler, &WebSocketClient),
-) {
-    let (handler, loop_, guard) = {
-        let mut state = shared.borrow_mut();
-        (
-            state.handler.take(),
-            state.loop_.clone(),
-            state.guard.upgrade(),
-        )
-    };
-    if let Some(mut handler) = handler {
-        let client =
-            WebSocketClient::new(shared.clone(), loop_, guard.unwrap_or_else(|| Rc::new(())));
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            callback(handler.as_mut(), &client)
-        }));
-        shared.borrow_mut().handler = Some(handler);
-        if let Err(panic) = result {
-            std::panic::resume_unwind(panic);
-        }
-    }
-}

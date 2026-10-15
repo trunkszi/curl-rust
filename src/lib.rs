@@ -34,10 +34,9 @@
 //!
 //! # What about multiple concurrent HTTP requests?
 //!
-//! One option you have currently is to send multiple requests in multiple
-//! threads, but otherwise libcurl has a "multi" interface for doing this
-//! operation. Initial bindings of this interface can be found in the `multi`
-//! module, but feedback is welcome!
+//! Multiple concurrent HTTP transfers and WebSockets are driven on a single
+//! thread through [`EventLoop`], [`http::HttpClient`], and
+//! [`websocket::WebSocketClient`].
 //!
 //! # Where does libcurl come from?
 //!
@@ -71,14 +70,14 @@ use std::ffi::CStr;
 use std::str;
 use std::sync::Once;
 
-pub use crate::error::{Error, FormError, MultiError, ShareError};
+pub use crate::error::{Error, FormError, MultiError};
 mod error;
 
 pub use crate::version::{Protocols, Version};
 mod version;
 
 pub mod easy;
-pub mod multi;
+pub(crate) mod multi;
 mod panic;
 
 #[cfg(test)]
@@ -91,7 +90,7 @@ static INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// program. This crate will do this for you automatically in the following
 /// scenarios:
 ///
-/// - Creating a new [`Easy`][easy::Easy] or [`Multi`][multi::Multi] handle
+/// - Creating a new [`Easy`][easy::Easy] or [`EventLoop`] handle
 /// - At program startup on Windows, macOS, Linux, Android, or FreeBSD systems
 ///
 /// This should be sufficient for most applications and scenarios, but in any
@@ -191,6 +190,6 @@ mod tests {
 pub mod event_loop;
 pub(crate) mod reactor;
 pub mod websocket;
-pub use event_loop::{EventLoop, Token, WatchEvents, WatchToken};
+pub use event_loop::{EventLoop, TimerToken, Token, WatchEvents, WatchToken};
 
 pub mod http;

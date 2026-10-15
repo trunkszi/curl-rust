@@ -117,16 +117,12 @@ fn main() {
         .define("CURL_DISABLE_FILE", None)
         .define("CURL_DISABLE_MQTT", None)
         .define("CURL_DISABLE_NETRC", None)
-        .define("CURL_DISABLE_MQTT", None)
         .define("HAVE_GETADDRINFO", None)
         .define("HAVE_GETPEERNAME", None)
         .define("HAVE_GETSOCKNAME", None)
         .warnings(false);
 
     let mut sources = vec![
-        "curl/lib/vtls/keylog.c",
-        "curl/lib/vquic/vquic.c",
-        "curl/lib/vquic/vquic-tls.c",
         "curl/lib/api.c",
         "curl/lib/uint-hashset.c",
         "curl/lib/vdns/asyn-base.c",
@@ -229,6 +225,8 @@ fn main() {
         "curl/lib/vauth/digest.c",
         "curl/lib/vauth/vauth.c",
         "curl/lib/version.c",
+        "curl/lib/vquic/vquic.c",
+        "curl/lib/vtls/keylog.c",
         "curl/lib/vtls/vtls.c",
         "curl/lib/vtls/vtls_config.c",
         "curl/lib/vtls/vtls_scache.c",

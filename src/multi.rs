@@ -235,6 +235,37 @@ impl Multi {
         unsafe { cvt(curl_sys::curl_multi_setopt(self.raw.handle, opt, val)) }
     }
 
+    fn setopt_long(&mut self, opt: curl_sys::CURLMoption, val: c_long) -> Result<(), MultiError> {
+        unsafe { cvt(curl_sys::curl_multi_setopt(self.raw.handle, opt, val)) }
+    }
+
+    /// Sets the maximum number of simultaneously open connections in total (`CURLMOPT_MAX_TOTAL_CONNECTIONS`).
+    pub fn max_total_connections(&mut self, max: usize) -> Result<(), MultiError> {
+        self.setopt_long(curl_sys::CURLMOPT_MAX_TOTAL_CONNECTIONS, max as c_long)
+    }
+
+    /// Sets the maximum number of simultaneously open connections to a single host (`CURLMOPT_MAX_HOST_CONNECTIONS`).
+    pub fn max_host_connections(&mut self, max: usize) -> Result<(), MultiError> {
+        self.setopt_long(curl_sys::CURLMOPT_MAX_HOST_CONNECTIONS, max as c_long)
+    }
+
+    /// Sets the maximum number of connections kept in the connection cache (`CURLMOPT_MAXCONNECTS`).
+    pub fn max_connects(&mut self, max: usize) -> Result<(), MultiError> {
+        self.setopt_long(curl_sys::CURLMOPT_MAXCONNECTS, max as c_long)
+    }
+
+    /// Enables or disables HTTP/1.1 pipelining and HTTP/2 multiplexing (`CURLMOPT_PIPELINING`).
+    pub fn pipelining(&mut self, http1: bool, multiplex: bool) -> Result<(), MultiError> {
+        let mut bits = curl_sys::CURLPIPE_NOTHING;
+        if http1 {
+            bits |= curl_sys::CURLPIPE_HTTP1;
+        }
+        if multiplex {
+            bits |= curl_sys::CURLPIPE_MULTIPLEX;
+        }
+        self.setopt_long(curl_sys::CURLMOPT_PIPELINING, bits)
+    }
+
     /// Add an easy handle to a multi session
     ///
     /// Adds a standard easy handle to the multi stack. This function call will
@@ -446,10 +477,16 @@ macro_rules! impl_easy_getters {
     };
 }
 
+#[allow(dead_code)]
 impl EasyHandle {
     pub(crate) fn easy_mut(&mut self) -> &mut Easy {
         &mut self.easy
     }
+
+    pub(crate) fn raw(&self) -> *mut curl_sys::CURL {
+        self.easy.raw()
+    }
+
     /// Sets an internal private token for this `EasyHandle`.
     ///
     /// This function will set the `CURLOPT_PRIVATE` field on the underlying
@@ -667,6 +704,7 @@ impl fmt::Debug for SocketEvents {
     }
 }
 
+#[allow(dead_code)]
 impl WaitFd {
     /// Constructs an empty (invalid) WaitFd.
     pub fn new() -> WaitFd {

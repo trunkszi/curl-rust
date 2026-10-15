@@ -16,7 +16,7 @@ struct Handler {
     done: Rc<RefCell<bool>>,
 }
 impl WebSocketHandler for Handler {
-    fn on_message(&mut self, ws: &WebSocketClient, message: Message) {
+    fn on_message(&mut self, ws: &WebSocketClient, message: Message<'_>) {
         if let Message::Text(text) = message {
             let mut n = self.counts.borrow_mut();
             if text.contains("@bookTicker") {

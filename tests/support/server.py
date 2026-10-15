@@ -27,11 +27,14 @@ if args.ws or args.wss:
     if os.getenv('WS_TLS'):
      ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain('tests/support/cert.pem','tests/support/key.pem'); c=ctx.wrap_socket(c,server_side=True)
     req=c.recv(4096).decode(); key=next(x.split(':',1)[1].strip() for x in req.split('\r\n') if x.lower().startswith('sec-websocket-key:'))
-    acc=base64.b64encode(hashlib.sha1((key+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode(); c.sendall(('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: '+acc+'\r\n\r\n').encode())
+    acc=base64.b64encode(hashlib.sha1((key+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode()
+    response=('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: '+acc+'\r\n\r\n').encode()
+    if os.getenv('WS_ACTIVE_CLOSE'):
+     # Send the upgrade and first frame together to exercise libcurl read-ahead.
+     response+=frame(8, struct.pack('!H', 1001) + b'going away')
+    c.sendall(response)
     if os.getenv('WS_CLOSE_AFTER_HANDSHAKE'):
      c.close(); s.close(); sys.exit(0)
-    if os.getenv('WS_ACTIVE_CLOSE'):
-     c.sendall(frame(8, struct.pack('!H', 1001) + b'going away'))
     while True:
      if os.getenv('WS_SLOW_READ'): time.sleep(0.2)
      h=c.recv(2)

@@ -71,8 +71,7 @@ pub struct Easy {
 pub(crate) struct Inner {
     handle: *mut curl_sys::CURL,
     pub(crate) header_list: Option<List>,
-    resolve_list: Option<List>,
-    connect_to_list: Option<List>,
+    pub(crate) resolve_list: Option<List>,
     proxy_header_list: Option<List>,
     form: Option<Form>,
     error_buf: RefCell<Vec<u8>>,
@@ -81,12 +80,15 @@ pub(crate) struct Inner {
     pub(crate) configured_port: Option<u16>,
     pub(crate) proxy_url: Option<String>,
     pub(crate) proxy_port: Option<u16>,
-    pub(crate) resolved_hosts: Vec<(String, u16)>,
+    pub(crate) resolved_hosts: Vec<(String, u16, Vec<IpAddr>)>,
     ssl_options: c_long,
+    pub(crate) explicit_resolve: bool,
+    pub(crate) resolved_hosts_from_client: bool,
     pub(crate) explicit_headers: bool,
     pub(crate) explicit_proxy: bool,
     pub(crate) explicit_timeout: bool,
     pub(crate) explicit_cainfo: bool,
+    pub(crate) client_config_id: Option<u64>,
 }
 
 /// Possible proxy types that libcurl currently understands.
@@ -280,12 +282,21 @@ impl Easy {
     /// This is crate-visible so the event-loop admission seam can enforce the
     /// application's DNS ownership before handing the handle to libcurl.
     pub(crate) fn validate_targets(&self) -> bool {
+        fn is_valid_scheme(s: &str) -> bool {
+            let mut bytes = s.bytes();
+            matches!(bytes.next(), Some(b'a'..=b'z' | b'A'..=b'Z'))
+                && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+        }
+
         fn authority(
             url: &str,
             fallback_port: u16,
             forced_port: Option<u16>,
         ) -> Option<(String, u16)> {
             let (scheme, rest) = url.split_once("://")?;
+            if !is_valid_scheme(scheme) {
+                return None;
+            }
             let authority = rest.split(['/', '?', '#']).next()?;
             if authority.is_empty() {
                 return None;
@@ -320,11 +331,13 @@ impl Easy {
                 }
                 (host.to_ascii_lowercase(), forced_port.unwrap_or(port))
             };
-            let _ = scheme;
             Some((host, port))
         }
 
-        fn prepared(target: Option<(String, u16)>, mappings: &[(String, u16)]) -> bool {
+        fn prepared(
+            target: Option<(String, u16)>,
+            mappings: &[(String, u16, Vec<IpAddr>)],
+        ) -> bool {
             let Some((host, port)) = target else {
                 return false;
             };
@@ -336,13 +349,16 @@ impl Easy {
             ip_literal
                 || mappings
                     .iter()
-                    .any(|(mapped, mapped_port)| mapped == &host && mapped_port == &port)
+                    .any(|(mapped, mapped_port, _)| mapped == &host && mapped_port == &port)
         }
 
         let Some(url) = self.inner.configured_url.as_deref() else {
             return false;
         };
-        let scheme = url.split_once("://").map_or("", |(s, _)| s);
+        let scheme = url
+            .split_once("://")
+            .filter(|(s, _)| is_valid_scheme(s))
+            .map_or("", |(s, _)| s);
         let url_port = self.inner.configured_port.unwrap_or(
             if scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("wss") {
                 443
@@ -359,7 +375,10 @@ impl Easy {
         let Some(proxy) = self.inner.proxy_url.as_deref().filter(|p| !p.is_empty()) else {
             return true;
         };
-        let proxy_scheme = proxy.split_once("://").map_or("", |(s, _)| s);
+        let (proxy_scheme, proxy_url) = match proxy.split_once("://") {
+            Some((s, _)) if is_valid_scheme(s) => (s, proxy.to_owned()),
+            _ => ("", format!("proxy://{proxy}")),
+        };
         let proxy_port =
             self.inner
                 .proxy_port
@@ -368,36 +387,153 @@ impl Easy {
                 } else {
                     1080
                 });
-        let proxy_url = if proxy.contains("://") {
-            proxy.to_owned()
-        } else {
-            format!("proxy://{proxy}")
-        };
         prepared(
+            // Unlike CURLOPT_PORT, CURLOPT_PROXYPORT is only a fallback when
+            // the proxy URL has no explicit port.
             authority(&proxy_url, proxy_port, None),
             &self.inner.resolved_hosts,
         )
     }
 
+    pub(crate) fn normalize_resolve_host(host: &str) -> &str {
+        host.strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(host)
+    }
+
+    pub(crate) fn format_resolve_entry(host: &str, port: u16, addrs: &[IpAddr]) -> String {
+        let joined = addrs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        if host.contains(':') {
+            format!("[{host}]:{port}:{joined}")
+        } else {
+            format!("{host}:{port}:{joined}")
+        }
+    }
+
     /// Preinstall application-resolved addresses for a host and port.
     pub fn resolve_host(&mut self, host: &str, port: u16, addrs: &[IpAddr]) -> Result<(), Error> {
-        let mut list = List::new();
-        for addr in addrs {
-            list.append(&format!("{host}:{port}:{addr}"))?;
+        let stripped = Self::normalize_resolve_host(host);
+        if stripped.is_empty() || addrs.is_empty() {
+            return Err(Error::new(curl_sys::CURLE_BAD_FUNCTION_ARGUMENT));
+        }
+        if self.inner.resolved_hosts_from_client {
+            self.inner.resolved_hosts.clear();
+            self.inner.resolve_list = None;
+            self.inner.resolved_hosts_from_client = false;
+        }
+        self.inner.explicit_resolve = true;
+        self.inner.client_config_id = None;
+        self.add_resolve_internal(stripped, port, addrs)
+    }
+
+    pub(crate) fn add_resolve_internal(
+        &mut self,
+        stripped_host: &str,
+        port: u16,
+        addrs: &[IpAddr],
+    ) -> Result<(), Error> {
+        let mut dedup_addrs = Vec::with_capacity(addrs.len());
+        for &addr in addrs {
+            if !dedup_addrs.contains(&addr) {
+                dedup_addrs.push(addr);
+            }
+        }
+        let normalized = stripped_host.to_ascii_lowercase();
+        if let Some(pos) = self
+            .inner
+            .resolved_hosts
+            .iter()
+            .position(|(h, p, _)| h == &normalized && *p == port)
+        {
+            if self.inner.resolved_hosts[pos].2 == dedup_addrs {
+                if let Some(ref list) = self.inner.resolve_list {
+                    let ptr = list::raw(list);
+                    self.setopt_ptr(curl_sys::CURLOPT_RESOLVE, ptr as *const _)?;
+                }
+                return Ok(());
+            }
+            let mut list = List::new();
+            for (idx, (h, p, existing_addrs)) in self.inner.resolved_hosts.iter().enumerate() {
+                let ips = if idx == pos {
+                    &dedup_addrs
+                } else {
+                    existing_addrs
+                };
+                list.append(&Self::format_resolve_entry(h, *p, ips))?;
+            }
+            self.resolve(list)?;
+            self.inner.resolved_hosts[pos].2 = dedup_addrs;
+            return Ok(());
+        }
+
+        let entry = Self::format_resolve_entry(&normalized, port, &dedup_addrs);
+        let mut list = self.inner.resolve_list.take().unwrap_or_else(List::new);
+        if let Err(err) = list.append(&entry) {
+            self.inner.resolve_list = Some(list);
+            return Err(err);
         }
         self.resolve(list)?;
         self.inner
             .resolved_hosts
-            .push((host.to_ascii_lowercase(), port));
+            .push((normalized, port, dedup_addrs));
         Ok(())
     }
+
+    pub(crate) fn apply_client_resolves(
+        &mut self,
+        defaults: &[(String, u16, Vec<IpAddr>)],
+        had_explicit_resolve: bool,
+    ) -> Result<(), Error> {
+        if !had_explicit_resolve {
+            self.inner.resolved_hosts.clear();
+            self.inner.resolve_list = None;
+            if defaults.is_empty() {
+                self.setopt_ptr(curl_sys::CURLOPT_RESOLVE, std::ptr::null())?;
+            } else {
+                let mut list = List::new();
+                for (h, p, ips) in defaults {
+                    list.append(&Self::format_resolve_entry(h, *p, ips))?;
+                    self.inner.resolved_hosts.push((h.clone(), *p, ips.clone()));
+                }
+                self.resolve(list)?;
+            }
+        } else {
+            for (h, p, ips) in defaults {
+                if !self
+                    .inner
+                    .resolved_hosts
+                    .iter()
+                    .any(|(eh, ep, _)| eh == h && ep == p)
+                {
+                    self.add_resolve_internal(h, *p, ips)?;
+                }
+            }
+        }
+        self.inner.resolved_hosts_from_client = true;
+        self.inner.explicit_resolve = false;
+        Ok(())
+    }
+
+    pub(crate) fn clear_timeout(&mut self) -> Result<(), Error> {
+        self.setopt_long(curl_sys::CURLOPT_TIMEOUT_MS, 0)
+    }
+
+    pub(crate) fn clear_headers(&mut self) -> Result<(), Error> {
+        self.inner.header_list = None;
+        self.setopt_ptr(curl_sys::CURLOPT_HTTPHEADER, std::ptr::null())
+    }
+
     /// Creates a new "easy" handle which is the core of almost all operations
     /// in libcurl.
     ///
     /// To use a handle, applications typically configure a number of options
-    /// followed by a call to `perform`. Options are preserved across calls to
-    /// `perform` and need to be reset manually (or via the `reset` method) if
-    /// this is not desired.
+    /// followed by submitting the handle to an [`EventLoop`][crate::EventLoop].
+    /// Options are preserved across transfers and need to be reset manually
+    /// (or via the `reset` method) if this is not desired.
     pub fn new() -> Easy {
         crate::init();
         unsafe {
@@ -409,7 +545,6 @@ impl Easy {
                     handle,
                     header_list: None,
                     resolve_list: None,
-                    connect_to_list: None,
                     proxy_header_list: None,
                     form: None,
                     error_buf: RefCell::new(vec![0; curl_sys::CURL_ERROR_SIZE]),
@@ -420,10 +555,13 @@ impl Easy {
                     proxy_port: None,
                     resolved_hosts: Vec::new(),
                     ssl_options: 0,
+                    explicit_resolve: false,
+                    resolved_hosts_from_client: false,
                     explicit_headers: false,
                     explicit_proxy: false,
                     explicit_timeout: false,
                     explicit_cainfo: false,
+                    client_config_id: None,
                 }),
             };
             ret.default_configure();
@@ -442,10 +580,13 @@ impl Easy {
         self.inner.proxy_url = None;
         self.inner.proxy_port = None;
         self.inner.resolved_hosts.clear();
+        self.inner.explicit_resolve = false;
+        self.inner.resolved_hosts_from_client = false;
         self.inner.explicit_headers = false;
         self.inner.explicit_proxy = false;
         self.inner.explicit_timeout = false;
         self.inner.explicit_cainfo = false;
+        self.inner.client_config_id = None;
         self.inner.header_list = None;
         self.inner.resolve_list = None;
         unsafe {
@@ -461,6 +602,7 @@ impl Easy {
         )
         .expect("failed to set error buffer");
         let _ = self.signal(false);
+        let _ = self.tcp_nodelay(true);
         self.inner.ssl_options = curl_sys::CURLSSLOPT_NATIVE_CA as c_long;
         let _ = self.setopt_long(curl_sys::CURLOPT_SSL_OPTIONS, self.inner.ssl_options);
 
@@ -682,24 +824,6 @@ impl Easy {
         self.setopt_long(curl_sys::CURLOPT_PORT, port as c_long)
     }
 
-    /// Connect to a specific host and port.
-    ///
-    /// Each single string should be written using the format
-    /// `HOST:PORT:CONNECT-TO-HOST:CONNECT-TO-PORT` where `HOST` is the host of
-    /// the request, `PORT` is the port of the request, `CONNECT-TO-HOST` is the
-    /// host name to connect to, and `CONNECT-TO-PORT` is the port to connect
-    /// to.
-    ///
-    /// The first string that matches the request's host and port is used.
-    ///
-    /// By default, this option is empty and corresponds to
-    /// [`CURLOPT_CONNECT_TO`](https://curl.haxx.se/libcurl/c/CURLOPT_CONNECT_TO.html).
-    pub fn connect_to(&mut self, list: List) -> Result<(), Error> {
-        let ptr = list::raw(&list);
-        self.inner.connect_to_list = Some(list);
-        self.setopt_ptr(curl_sys::CURLOPT_CONNECT_TO, ptr as *const _)
-    }
-
     /// Indicates whether sequences of `/../` and `/./` will be squashed or not.
     ///
     /// By default this option is `false` and corresponds to
@@ -717,6 +841,7 @@ impl Easy {
         if result.is_ok() {
             self.inner.proxy_url = Some(url.to_string_lossy().into_owned());
             self.inner.explicit_proxy = true;
+            self.inner.client_config_id = None;
         }
         result
     }
@@ -725,9 +850,15 @@ impl Easy {
     ///
     /// By default this option is not set (the default port for the proxy
     /// protocol is used) and corresponds to `CURLOPT_PROXYPORT`.
+    /// An explicit port in the proxy URL takes precedence over this option.
     pub fn proxy_port(&mut self, port: u16) -> Result<(), Error> {
-        self.inner.proxy_port = Some(port);
-        self.setopt_long(curl_sys::CURLOPT_PROXYPORT, port as c_long)
+        let result = self.setopt_long(curl_sys::CURLOPT_PROXYPORT, port as c_long);
+        if result.is_ok() {
+            self.inner.proxy_port = Some(port);
+            self.inner.explicit_proxy = true;
+            self.inner.client_config_id = None;
+        }
+        result
     }
 
     /// Set CA certificate to verify peer against for proxy.
@@ -897,19 +1028,6 @@ impl Easy {
         self.setopt_long(curl_sys::CURLOPT_LOCALPORTRANGE, range as c_long)
     }
 
-    /// Sets the DNS servers that wil be used.
-    ///
-    /// Provide a comma separated list, for example: `8.8.8.8,8.8.4.4`.
-    ///
-    /// By default this option is not set and the OS's DNS resolver is used.
-    /// This option can only be used if libcurl is linked against
-    /// [c-ares](https://c-ares.haxx.se), otherwise setting it will return
-    /// an error.
-    pub fn dns_servers(&mut self, servers: &str) -> Result<(), Error> {
-        let s = CString::new(servers)?;
-        self.setopt_str(curl_sys::CURLOPT_DNS_SERVERS, &s)
-    }
-
     /// Sets the timeout of how long name resolves will be kept in memory.
     ///
     /// This is distinct from DNS TTL options and is entirely speculative.
@@ -918,115 +1036,6 @@ impl Easy {
     /// `CURLOPT_DNS_CACHE_TIMEOUT`.
     pub fn dns_cache_timeout(&mut self, dur: Duration) -> Result<(), Error> {
         self.setopt_long(curl_sys::CURLOPT_DNS_CACHE_TIMEOUT, dur.as_secs() as c_long)
-    }
-
-    /// Provide the DNS-over-HTTPS URL.
-    ///
-    /// The parameter must be URL-encoded in the following format:
-    /// `https://host:port/path`. It **must** specify a HTTPS URL.
-    ///
-    /// libcurl does not validate the syntax or use this variable until the
-    /// transfer is issued. Even if you set a crazy value here, this method will
-    /// still return [`Ok`].
-    ///
-    /// curl sends `POST` requests to the given DNS-over-HTTPS URL.
-    ///
-    /// To find the DoH server itself, which might be specified using a name,
-    /// libcurl will use the default name lookup function. You can bootstrap
-    /// that by providing the address for the DoH server with
-    /// [`Easy::resolve`].
-    ///
-    /// Disable DoH use again by setting this option to [`None`].
-    ///
-    /// By default this option is not set and corresponds to `CURLOPT_DOH_URL`.
-
-    /// This option tells curl to verify the authenticity of the DoH
-    /// (DNS-over-HTTPS) server's certificate. A value of `true` means curl
-    /// verifies; `false` means it does not.
-    ///
-    /// This option is the DoH equivalent of [`Easy::ssl_verify_peer`] and only
-    /// affects requests to the DoH server.
-    ///
-    /// When negotiating a TLS or SSL connection, the server sends a certificate
-    /// indicating its identity. Curl verifies whether the certificate is
-    /// authentic, i.e. that you can trust that the server is who the
-    /// certificate says it is. This trust is based on a chain of digital
-    /// signatures, rooted in certification authority (CA) certificates you
-    /// supply. curl uses a default bundle of CA certificates (the path for that
-    /// is determined at build time) and you can specify alternate certificates
-    /// with the [`Easy::cainfo`] option or the [`Easy::capath`] option.
-    ///
-    /// When `doh_ssl_verify_peer` is enabled, and the verification fails to
-    /// prove that the certificate is authentic, the connection fails. When the
-    /// option is zero, the peer certificate verification succeeds regardless.
-    ///
-    /// Authenticating the certificate is not enough to be sure about the
-    /// server. You typically also want to ensure that the server is the server
-    /// you mean to be talking to. Use [`Easy::doh_ssl_verify_host`] for that.
-    /// The check that the host name in the certificate is valid for the host
-    /// name you are connecting to is done independently of the
-    /// `doh_ssl_verify_peer` option.
-    ///
-    /// **WARNING:** disabling verification of the certificate allows bad guys
-    /// to man-in-the-middle the communication without you knowing it. Disabling
-    /// verification makes the communication insecure. Just having encryption on
-    /// a transfer is not enough as you cannot be sure that you are
-    /// communicating with the correct end-point.
-    ///
-    /// By default this option is set to `true` and corresponds to
-    /// `CURLOPT_DOH_SSL_VERIFYPEER`.
-    pub fn doh_ssl_verify_peer(&mut self, verify: bool) -> Result<(), Error> {
-        self.setopt_long(curl_sys::CURLOPT_DOH_SSL_VERIFYPEER, verify.into())
-    }
-
-    /// Tells curl to verify the DoH (DNS-over-HTTPS) server's certificate name
-    /// fields against the host name.
-    ///
-    /// This option is the DoH equivalent of [`Easy::ssl_verify_host`] and only
-    /// affects requests to the DoH server.
-    ///
-    /// When `doh_ssl_verify_host` is `true`, the SSL certificate provided by
-    /// the DoH server must indicate that the server name is the same as the
-    /// server name to which you meant to connect to, or the connection fails.
-    ///
-    /// Curl considers the DoH server the intended one when the Common Name
-    /// field or a Subject Alternate Name field in the certificate matches the
-    /// host name in the DoH URL to which you told Curl to connect.
-    ///
-    /// When the verify value is set to `false`, the connection succeeds
-    /// regardless of the names used in the certificate. Use that ability with
-    /// caution!
-    ///
-    /// See also [`Easy::doh_ssl_verify_peer`] to verify the digital signature
-    /// of the DoH server certificate. If libcurl is built against NSS and
-    /// [`Easy::doh_ssl_verify_peer`] is `false`, `doh_ssl_verify_host` is also
-    /// set to `false` and cannot be overridden.
-    ///
-    /// By default this option is set to `true` and corresponds to
-    /// `CURLOPT_DOH_SSL_VERIFYHOST`.
-    pub fn doh_ssl_verify_host(&mut self, verify: bool) -> Result<(), Error> {
-        self.setopt_long(
-            curl_sys::CURLOPT_DOH_SSL_VERIFYHOST,
-            if verify { 2 } else { 0 },
-        )
-    }
-
-    /// Pass a long as parameter set to 1 to enable or 0 to disable.
-    ///
-    /// This option determines whether libcurl verifies the status of the DoH
-    /// (DNS-over-HTTPS) server cert using the "Certificate Status Request" TLS
-    /// extension (aka. OCSP stapling).
-    ///
-    /// This option is the DoH equivalent of CURLOPT_SSL_VERIFYSTATUS and only
-    /// affects requests to the DoH server.
-    ///
-    /// Note that if this option is enabled but the server does not support the
-    /// TLS extension, the verification will fail.
-    ///
-    /// By default this option is set to `false` and corresponds to
-    /// `CURLOPT_DOH_SSL_VERIFYSTATUS`.
-    pub fn doh_ssl_verify_status(&mut self, verify: bool) -> Result<(), Error> {
-        self.setopt_long(curl_sys::CURLOPT_DOH_SSL_VERIFYSTATUS, verify.into())
     }
 
     /// Specify the preferred receive buffer size, in bytes.
@@ -1052,13 +1061,6 @@ impl Easy {
         self.setopt_long(curl_sys::CURLOPT_UPLOAD_BUFFERSIZE, size as c_long)
     }
 
-    // /// Enable or disable TCP Fast Open
-    // ///
-    // /// By default this options defaults to `false` and corresponds to
-    // /// `CURLOPT_TCP_FASTOPEN`
-    // pub fn fast_open(&mut self, enable: bool) -> Result<(), Error> {
-    // }
-
     /// Configures whether the TCP_NODELAY option is set, or Nagle's algorithm
     /// is disabled.
     ///
@@ -1066,7 +1068,7 @@ impl Easy {
     /// packet's on the network, and disabling this may be less efficient in
     /// some situations.
     ///
-    /// By default this option is `false` and corresponds to
+    /// By default this option is `true` and corresponds to
     /// `CURLOPT_TCP_NODELAY`.
     pub fn tcp_nodelay(&mut self, enable: bool) -> Result<(), Error> {
         self.setopt_long(curl_sys::CURLOPT_TCP_NODELAY, enable as c_long)
@@ -1144,29 +1146,6 @@ impl Easy {
         self.setopt_long(curl_sys::CURLOPT_HTTPAUTH, auth.bits)
     }
 
-    /// Provides AWS V4 signature authentication on HTTP(S) header.
-    ///
-    /// `param` is used to create outgoing authentication headers.
-    /// Its format is `provider1[:provider2[:region[:service]]]`.
-    /// `provider1,\ provider2"` are used for generating auth parameters
-    /// such as "Algorithm", "date", "request type" and "signed headers".
-    /// `region` is the geographic area of a resources collection. It is
-    /// extracted from the host name specified in the URL if omitted.
-    /// `service` is a function provided by a cloud. It is extracted
-    /// from the host name specified in the URL if omitted.
-    ///
-    /// Example with "Test:Try", when curl will do the algorithm, it will
-    /// generate "TEST-HMAC-SHA256" for "Algorithm", "x-try-date" and
-    /// "X-Try-Date" for "date", "test4_request" for "request type", and
-    /// "SignedHeaders=content-type;host;x-try-date" for "signed headers".
-    /// If you use just "test", instead of "test:try", test will be use
-    /// for every strings generated.
-    ///
-    /// This is a special auth type that can't be combined with the others.
-    /// It will override the other auth types you might have set.
-    ///
-    /// By default this is not set and corresponds to `CURLOPT_AWS_SIGV4`.
-
     /// Configures the proxy username to pass as authentication for this
     /// connection.
     ///
@@ -1200,17 +1179,8 @@ impl Easy {
         self.setopt_long(curl_sys::CURLOPT_PROXYAUTH, auth.bits)
     }
 
-    /// Enable .netrc parsing
-    ///
-    /// By default the .netrc file is ignored and corresponds to `CURL_NETRC_IGNORED`.
-
     // =========================================================================
     // HTTP Options
-
-    /// Indicates whether the referer header is automatically updated
-    ///
-    /// By default this option is `false` and corresponds to
-    /// `CURLOPT_AUTOREFERER`.
 
     /// Enables automatic decompression of HTTP downloads.
     ///
@@ -1234,34 +1204,6 @@ impl Easy {
     pub fn transfer_encoding(&mut self, enable: bool) -> Result<(), Error> {
         self.setopt_long(curl_sys::CURLOPT_TRANSFER_ENCODING, enable as c_long)
     }
-
-    /// Follow HTTP 3xx redirects.
-    ///
-    /// Indicates whether any `Location` headers in the response should get
-    /// followed.
-    ///
-    /// By default this option is `false` and corresponds to
-    /// `CURLOPT_FOLLOWLOCATION`.
-
-    /// Send credentials to hosts other than the first as well.
-    ///
-    /// Sends username/password credentials even when the host changes as part
-    /// of a redirect.
-    ///
-    /// By default this option is `false` and corresponds to
-    /// `CURLOPT_UNRESTRICTED_AUTH`.
-
-    /// Set the maximum number of redirects allowed.
-    ///
-    /// A value of 0 will refuse any redirect.
-    ///
-    /// By default this option is `-1` (unlimited) and corresponds to
-    /// `CURLOPT_MAXREDIRS`.
-
-    /// Set the policy for handling redirects to POST requests.
-    ///
-    /// By default a POST is changed to a GET when following a redirect. Setting any
-    /// selected response codes.
 
     /// Make an HTTP PUT request.
     ///
@@ -1377,6 +1319,7 @@ impl Easy {
         if result.is_ok() {
             self.inner.header_list = Some(list);
             self.inner.explicit_headers = true;
+            self.inner.client_config_id = None;
         }
         result
     }
@@ -1499,13 +1442,6 @@ impl Easy {
         self.setopt_long(curl_sys::CURLOPT_HTTPGET, enable as c_long)
     }
 
-    // /// Ask for a HTTP GET request.
-    // ///
-    // /// By default this option is `false` and corresponds to `CURLOPT_HTTPGET`.
-    // pub fn http_version(&mut self, vers: &str) -> Result<(), Error> {
-    //     self.setopt_long(curl_sys::CURLOPT_HTTPGET, enable as c_long)
-    // }
-
     /// Ignore the content-length header.
     ///
     /// By default this option is `false` and corresponds to
@@ -1529,42 +1465,6 @@ impl Easy {
     pub fn http_transfer_decoding(&mut self, enable: bool) -> Result<(), Error> {
         self.setopt_long(curl_sys::CURLOPT_HTTP_TRANSFER_DECODING, enable as c_long)
     }
-
-    // /// Timeout for the Expect: 100-continue response
-    // ///
-    // /// By default this option is 1s and corresponds to
-    // /// `CURLOPT_EXPECT_100_TIMEOUT_MS`.
-    // pub fn expect_100_timeout(&mut self, enable: bool) -> Result<(), Error> {
-    //     self.setopt_long(curl_sys::CURLOPT_HTTP_TRANSFER_DECODING,
-    //                      enable as c_long)
-    // }
-
-    // /// Wait for pipelining/multiplexing.
-    // ///
-    // /// Tells libcurl to prefer to wait for a connection to confirm or deny that
-    // /// it can do pipelining or multiplexing before continuing.
-    // ///
-    // /// When about to perform a new transfer that allows pipelining or
-    // /// multiplexing, libcurl will check for existing connections to re-use and
-    // /// pipeline on. If no such connection exists it will immediately continue
-    // /// and create a fresh new connection to use.
-    // ///
-    // /// By setting this option to `true` - having `pipeline` enabled for the
-    // /// multi handle this transfer is associated with - libcurl will instead
-    // /// wait for the connection to reveal if it is possible to
-    // /// pipeline/multiplex on before it continues. This enables libcurl to much
-    // /// better keep the number of connections to a minimum when using pipelining
-    // /// or multiplexing protocols.
-    // ///
-    // /// The effect thus becomes that with this option set, libcurl prefers to
-    // /// wait and re-use an existing connection for pipelining rather than the
-    // /// opposite: prefer to open a new connection rather than waiting.
-    // ///
-    // /// The waiting time is as long as it takes for the connection to get up and
-    // /// for libcurl to get the necessary response back that informs it about its
-    // /// protocol and support level.
-    // pub fn http_pipewait(&mut self, enable: bool) -> Result<(), Error> {
-    // }
 
     // =========================================================================
     // Protocol Options
@@ -1714,6 +1614,7 @@ impl Easy {
                 let r = self.setopt_long(curl_sys::CURLOPT_TIMEOUT_MS, amt);
                 if r.is_ok() {
                     self.inner.explicit_timeout = true;
+                    self.inner.client_config_id = None;
                 }
                 r
             }
@@ -1723,6 +1624,7 @@ impl Easy {
                 let r = self.setopt_long(curl_sys::CURLOPT_TIMEOUT, amt);
                 if r.is_ok() {
                     self.inner.explicit_timeout = true;
+                    self.inner.client_config_id = None;
                 }
                 r
             }
@@ -1869,30 +1771,18 @@ impl Easy {
         self.setopt_long(curl_sys::CURLOPT_IPRESOLVE, resolve as c_long)
     }
 
-    /// Specify custom host name to IP address resolves.
-    ///
-    /// Allows specifying hostname to IP mappins to use before trying the
-    /// system resolver.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use curl::easy::{Easy, List};
-    ///
-    /// let mut list = List::new();
-    /// list.append("www.rust-lang.org:443:185.199.108.153").unwrap();
-    ///
-    /// let mut handle = Easy::new();
-    /// handle.url("https://www.rust-lang.org/").unwrap();
-    /// handle.resolve(list).unwrap();
-    /// let mut event_loop = curl::EventLoop::new().unwrap();
-    /// event_loop.add(handle, |_, _| {}).unwrap();
-    /// event_loop.run().unwrap();
-    /// ```
-    pub fn resolve(&mut self, list: List) -> Result<(), Error> {
+    fn resolve(&mut self, list: List) -> Result<(), Error> {
         let ptr = list::raw(&list);
         self.inner.resolve_list = Some(list);
         self.setopt_ptr(curl_sys::CURLOPT_RESOLVE, ptr as *const _)
+    }
+
+    pub(crate) fn rearm_resolve(&mut self) -> Result<(), Error> {
+        if let Some(list) = self.inner.resolve_list.as_ref() {
+            let ptr = list::raw(list);
+            self.setopt_ptr(curl_sys::CURLOPT_RESOLVE, ptr as *const _)?;
+        }
+        Ok(())
     }
 
     /// Configure whether to stop when connected to target server
@@ -1924,60 +1814,6 @@ impl Easy {
     pub fn websocket_connect_only(&mut self) -> Result<(), Error> {
         self.setopt_long(curl_sys::CURLOPT_CONNECT_ONLY, 2)
     }
-
-    // /// Set interface to speak DNS over.
-    // ///
-    // /// Set the name of the network interface that the DNS resolver should bind
-    // /// to. This must be an interface name (not an address).
-    // ///
-    // /// By default this option is not set and corresponds to
-    // /// `CURLOPT_DNS_INTERFACE`.
-    // pub fn dns_interface(&mut self, interface: &str) -> Result<(), Error> {
-    //     let interface = CString::new(interface)?;
-    //     self.setopt_str(curl_sys::CURLOPT_DNS_INTERFACE, &interface)
-    // }
-    //
-    // /// IPv4 address to bind DNS resolves to
-    // ///
-    // /// Set the local IPv4 address that the resolver should bind to. The
-    // /// argument should be of type char * and contain a single numerical IPv4
-    // /// address as a string.
-    // ///
-    // /// By default this option is not set and corresponds to
-    // /// `CURLOPT_DNS_LOCAL_IP4`.
-    // pub fn dns_local_ip4(&mut self, ip: &str) -> Result<(), Error> {
-    //     let ip = CString::new(ip)?;
-    //     self.setopt_str(curl_sys::CURLOPT_DNS_LOCAL_IP4, &ip)
-    // }
-    //
-    // /// IPv6 address to bind DNS resolves to
-    // ///
-    // /// Set the local IPv6 address that the resolver should bind to. The
-    // /// argument should be of type char * and contain a single numerical IPv6
-    // /// address as a string.
-    // ///
-    // /// By default this option is not set and corresponds to
-    // /// `CURLOPT_DNS_LOCAL_IP6`.
-    // pub fn dns_local_ip6(&mut self, ip: &str) -> Result<(), Error> {
-    //     let ip = CString::new(ip)?;
-    //     self.setopt_str(curl_sys::CURLOPT_DNS_LOCAL_IP6, &ip)
-    // }
-    //
-    // /// Set preferred DNS servers.
-    // ///
-    // /// Provides a list of DNS servers to be used instead of the system default.
-    // /// The format of the dns servers option is:
-    // ///
-    // /// ```text
-    // /// host[:port],[host[:port]]...
-    // /// ```
-    // ///
-    // /// By default this option is not set and corresponds to
-    // /// `CURLOPT_DNS_SERVERS`.
-    // pub fn dns_servers(&mut self, servers: &str) -> Result<(), Error> {
-    //     let servers = CString::new(servers)?;
-    //     self.setopt_str(curl_sys::CURLOPT_DNS_SERVERS, &servers)
-    // }
 
     // =========================================================================
     // SSL/Security Options
@@ -2131,19 +1967,6 @@ impl Easy {
         self.setopt_long(curl_sys::CURLOPT_SSLENGINE_DEFAULT, enable as c_long)
     }
 
-    // /// Enable TLS false start.
-    // ///
-    // /// This option determines whether libcurl should use false start during the
-    // /// TLS handshake. False start is a mode where a TLS client will start
-    // /// sending application data before verifying the server's Finished message,
-    // /// thus saving a round trip when performing a full handshake.
-    // ///
-    // /// By default this option is not set and corresponds to
-    // /// `CURLOPT_SSL_FALSESTARTE`.
-    // pub fn ssl_false_start(&mut self, enable: bool) -> Result<(), Error> {
-    //     self.setopt_long(curl_sys::CURLOPT_SSLENGINE_DEFAULT, enable as c_long)
-    // }
-
     /// Set preferred HTTP version.
     ///
     /// By default this option is not set and corresponds to
@@ -2241,18 +2064,6 @@ impl Easy {
         self.setopt_long(curl_sys::CURLOPT_PROXY_SSL_VERIFYPEER, verify as c_long)
     }
 
-    // /// Verify the certificate's status.
-    // ///
-    // /// This option determines whether libcurl verifies the status of the server
-    // /// cert using the "Certificate Status Request" TLS extension (aka. OCSP
-    // /// stapling).
-    // ///
-    // /// By default this option is set to `false` and corresponds to
-    // /// `CURLOPT_SSL_VERIFYSTATUS`.
-    // pub fn ssl_verify_status(&mut self, verify: bool) -> Result<(), Error> {
-    //     self.setopt_long(curl_sys::CURLOPT_SSL_VERIFYSTATUS, verify as c_long)
-    // }
-
     /// Specify the path to Certificate Authority (CA) bundle
     ///
     /// The file referenced should hold one or more certificates to verify the
@@ -2271,6 +2082,7 @@ impl Easy {
         let r = self.setopt_path(curl_sys::CURLOPT_CAINFO, path.as_ref());
         if r.is_ok() {
             self.inner.explicit_cainfo = true;
+            self.inner.client_config_id = None;
         }
         r
     }
@@ -2538,22 +2350,6 @@ impl Easy {
     pub fn proxy_ssl_options(&mut self, bits: &SslOpt) -> Result<(), Error> {
         self.setopt_long(curl_sys::CURLOPT_PROXY_SSL_OPTIONS, bits.bits)
     }
-
-    // /// Stores a private pointer-sized piece of data.
-    // ///
-    // /// This can be retrieved through the `private` function and otherwise
-    // /// libcurl does not tamper with this value. This corresponds to
-    // /// `CURLOPT_PRIVATE` and defaults to 0.
-    // pub fn set_private(&mut self, private: usize) -> Result<(), Error> {
-    //     self.setopt_ptr(curl_sys::CURLOPT_PRIVATE, private as *const _)
-    // }
-    //
-    // /// Fetches this handle's private pointer-sized piece of data.
-    // ///
-    // /// This corresponds to `CURLINFO_PRIVATE` and defaults to 0.
-    // pub fn private(&self) -> Result<usize, Error> {
-    //     self.getopt_ptr(curl_sys::CURLINFO_PRIVATE).map(|p| p as usize)
-    // }
 
     // =========================================================================
     // getters
@@ -3003,18 +2799,6 @@ impl Easy {
     // =========================================================================
     // Other methods
 
-    /// After options have been set, this will perform the transfer described by
-    /// the options.
-    ///
-    /// Some protocols have "connection upkeep" mechanisms. These mechanisms
-    /// usually send some traffic on existing connections in order to keep them
-    /// alive; this can prevent connections from being closed due to overzealous
-    /// firewalls, for example.
-    ///
-    /// Currently the only protocol with a connection upkeep mechanism is
-    /// HTTP/2: when the connection upkeep interval is exceeded and upkeep() is
-    /// called, an HTTP/2 PING frame is sent on the connection.
-
     /// Unpause reading on a connection.
     ///
     /// Using this function, you can explicitly unpause a connection that was
@@ -3035,8 +2819,6 @@ impl Easy {
             self.cvt(rc)
         }
     }
-
-    /// Unpause reading on a connection.
 
     /// Unpause writing on a connection.
     ///
@@ -3111,34 +2893,6 @@ impl Easy {
             ret
         }
     }
-
-    // TODO: I don't think this is safe, you can drop this which has all the
-    //       callback data and then the next is use-after-free
-    //
-    // /// Attempts to clone this handle, returning a new session handle with the
-    // /// same options set for this handle.
-    // ///
-    // /// Internal state info and things like persistent connections ccannot be
-    // /// transferred.
-    // ///
-    // /// # Errors
-    // ///
-    // /// If a new handle could not be allocated or another error happens, `None`
-    // /// is returned.
-    // pub fn try_clone<'b>(&mut self) -> Option<Easy<'b>> {
-    //     unsafe {
-    //         let handle = curl_sys::curl_easy_duphandle(self.handle);
-    //         if handle.is_null() {
-    //             None
-    //         } else {
-    //             Some(Easy {
-    //                 handle: handle,
-    //                 data: blank_data(),
-    //                 _marker: marker::PhantomData,
-    //             })
-    //         }
-    //     }
-    // }
 
     /// Receives data from a connected socket.
     ///
@@ -3495,56 +3249,6 @@ impl Auth {
     pub fn digest_ie(&mut self, on: bool) -> &mut Auth {
         self.flag(curl_sys::CURLAUTH_DIGEST_IE, on)
     }
-
-    /// HTTP Negotiate (SPNEGO) authentication.
-    ///
-    /// Negotiate authentication is defined in RFC 4559 and is the most secure
-    /// way to perform authentication over HTTP.
-    ///
-    /// You need to build libcurl with a suitable GSS-API library or SSPI on
-    /// Windows for this to work.
-
-    /// HTTP NTLM authentication.
-    ///
-    /// A proprietary protocol invented and used by Microsoft. It uses a
-    /// challenge-response and hash concept similar to Digest, to prevent the
-    /// password from being eavesdropped.
-    ///
-    /// You need to build libcurl with either OpenSSL, GnuTLS or NSS support for
-    /// this option to work, or build libcurl on Windows with SSPI support.
-
-    /// NTLM delegating to winbind helper.
-    ///
-    /// Authentication is performed by a separate binary application that is
-    /// executed when needed. The name of the application is specified at
-    /// compile time but is typically /usr/bin/ntlm_auth
-    ///
-    /// Note that libcurl will fork when necessary to run the winbind
-    /// application and kill it when complete, calling waitpid() to await its
-    /// exit when done. On POSIX operating systems, killing the process will
-    /// cause a SIGCHLD signal to be raised (regardless of whether
-    /// CURLOPT_NOSIGNAL is set), which must be handled intelligently by the
-    /// application. In particular, the application must not unconditionally
-    /// call wait() in its SIGCHLD signal handler to avoid being subject to a
-    /// race condition. This behavior is subject to change in future versions of
-    /// libcurl.
-    ///
-    /// A proprietary protocol invented and used by Microsoft. It uses a
-    /// challenge-response and hash concept similar to Digest, to prevent the
-    /// password from being eavesdropped.
-
-    /// HTTP AWS V4 signature authentication.
-    ///
-    /// This is a special auth type that can't be combined with the others.
-    /// It will override the other auth types you might have set.
-    ///
-    /// Enabling this auth type is the same as using "aws:amz" as param in
-    /// [`Easy::aws_sigv4`](struct.Easy.html#method.aws_sigv4) method.
-
-    /// HTTP Auto authentication.
-    ///
-    /// This is a combination for CURLAUTH_BASIC | CURLAUTH_DIGEST |
-    /// CURLAUTH_GSSNEGOTIATE | CURLAUTH_NTLM
 
     fn flag(&mut self, bit: c_ulong, on: bool) -> &mut Auth {
         if on {
